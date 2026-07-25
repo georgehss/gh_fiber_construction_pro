@@ -1,0 +1,7 @@
+requests
+duckdb
+shapely
+overturemaps
+pyarrow
+pandas
+scikit-learn

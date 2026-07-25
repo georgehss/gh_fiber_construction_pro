@@ -1,0 +1,5 @@
+Eu sou um projetista de rede de internet gpon FTTH. Estou fazendo um projeto no Google Earth Pro. Estou demarcando o polígono da área que vai ser cabeada, e através desse polígono, vou fazer a contagem das residências dentro da área do polígono. Depois que eu tiver o HP da região demarcada pelo polígono, vou saber quantas CTOs vão ser precisa para atender essa quantidade de residências, no caso, 50% de penetração. A partir do números de CTOs, vou saber quantas PONs serão necessárias para atender toda a região, e quantas CEOs serão preciso para instalação das PONs. Cada CEO vai acomodar duas PONs, e cada PON com Splitter 1x8, sendo 8 CTOs por cada PON.
+
+Sabendo dessas informações, queria automatizar essa tarefa. Vou enviar arquivos de referências para análise, para verificar se isso seria possível.
+
+Em anexo, estão os arquivos de um projeto existente feito manualmente pelo projetista.
