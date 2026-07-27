@@ -1,0 +1,11 @@
+{
+    "engenharia": {
+        "penetracao_estimada": 0.50,
+        "capacidade_splitter_cto": 8,
+        "ctos_por_pon": 8,
+        "pons_por_ceo": 2
+    },
+    "equipamentos": {
+        "nome_olt_padrao": "N70"
+    }
+}

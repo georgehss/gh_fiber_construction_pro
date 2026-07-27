@@ -1,15 +1,40 @@
 import xml.etree.ElementTree as ET
-import math
-import os
-import json
-import overturemaps
+import math, os, json, sys, overturemaps
 from shapely.geometry import Polygon
 from shapely import wkb
+from pathlib import Path
+
+# 1. Identifica a pasta raiz do projeto de forma dinâmica
+# Como o script está em src/, o parent dele é a raiz do projeto
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 2. Define os caminhos das pastas de dados
+INPUT_DIR = BASE_DIR / "data" / "input"
+OUTPUT_DIR = BASE_DIR / "data" / "output"
+
+# 3. Busca automaticamente arquivos KML ou KMZ na pasta de entrada
+arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
+
+if not arquivos_kml:
+    print("Erro: Nenhum arquivo KML ou KMZ encontrado em data/input/")
+    sys.exit()
+
+# Seleciona o primeiro arquivo encontrado para processamento
+arquivo_projeto = arquivos_kml[0]
+nome_projeto = arquivo_projeto.stem # Pega o nome sem a extensão (ex: "Expansão Centro")
+
+# Lê as configurações globais do projeto
+CONFIG_FILE = BASE_DIR / "config.json"
+with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+    CONFIG = json.load(f)
+
+print(f"Iniciando processamento do projeto: {nome_projeto}")
 
 KML_NS = 'http://www.opengis.net/kml/2.2'
 ET.register_namespace('', KML_NS)
 
-CACHE_CASAS = "casas_detectadas_cache.json"
+# Salva o cache de casas detectadas na pasta de output
+CACHE_CASAS = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
 
 def extrair_poligonos_kml(caminho_kml):
     tree = ET.parse(caminho_kml)
@@ -74,7 +99,8 @@ def obter_posicoes_casas(bbox, poly_geom):
         print(f"   💾 Cache criado com sucesso: '{CACHE_CASAS}' ({len(pontos_casas)} casas)")
         
         # Cria também um KML visual das casas para abrir no QGIS/Google Earth
-        gerar_kml_casas("0.0. Residencias (HP Detectadas).kml", pontos_casas)
+        caminho_kml_casas = OUTPUT_DIR / f"{nome_projeto} - 0.0. Residencias (HP Detectadas).kml"
+        gerar_kml_casas(caminho_kml_casas, pontos_casas)
         
         return pontos_casas
     except Exception as e:
@@ -102,16 +128,22 @@ def gerar_kml_casas(nome_arquivo, pontos):
     print(f"   📄 KML com marcadores das casas salvo em: '{nome_arquivo}'")
 
 def calcular_ftth(hp):
-    penetracao = 0.50
+    eng = CONFIG['engenharia']
+    penetracao = eng['penetracao_estimada']
+    cap_cto = eng['capacidade_splitter_cto']
+    cap_pon = eng['ctos_por_pon']
+    cap_ceo = eng['pons_por_ceo']
+    
     hc = math.ceil(hp * penetracao)
-    ctos = math.ceil(hc / 8)          # 1 CTO atende 8 HCs (Splitter 1x8)
-    pons = math.ceil(ctos / 8)        # 1 PON atende 8 CTOs
-    ceos = math.ceil(pons / 2)        # 1 CEO acomoda 2 PONs
+    ctos = math.ceil(hc / cap_cto)
+    pons = math.ceil(ctos / cap_pon)
+    ceos = math.ceil(pons / cap_ceo)
     return hc, ctos, pons, ceos
 
 # --- Execução ---
 if __name__ == "__main__":
-    arquivo_kml = "Expansão BHS.kml"
+    # Usa o arquivo KML/KMZ encontrado automaticamente na pasta data/input/
+    arquivo_kml = str(arquivo_projeto)
     
     print("🔍 Lendo polígonos do KML...")
     try:
@@ -133,8 +165,23 @@ if __name__ == "__main__":
                 print(f"📦 CTOs Necessárias (1x8):           {ctos}")
                 print(f"⚡ PONs Necessárias:                 {pons}")
                 print(f"🔀 CEOs Necessárias:     {ceos}\n")
+
+                # Salva os cálculos para o script de posicionamento ler depois
+                dados_projeto = {
+                    "hp": hp,
+                    "hc": hc,
+                    "ctos": ctos,
+                    "pons": pons,
+                    "ceos": ceos
+                }
+                caminho_dados = OUTPUT_DIR / f"{nome_projeto}_dados_calculados.json"
+                with open(caminho_dados, 'w', encoding='utf-8') as f:
+                    json.dump(dados_projeto, f, indent=4)
+
             else:
                 print("⚠️ Nenhuma edificação foi detectada dentro deste polígono.\n")
+
+            
                 
     except FileNotFoundError:
         print(f"❌ Arquivo '{arquivo_kml}' não foi encontrado.")

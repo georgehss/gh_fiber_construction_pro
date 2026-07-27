@@ -1,17 +1,42 @@
 import xml.etree.ElementTree as ET
-import math
-import json
-import os
-import requests
+import math, json, os, requests, sys
 from shapely.geometry import Polygon, Point, MultiLineString, LineString
 from shapely.ops import nearest_points
 from sklearn.cluster import KMeans
 import numpy as np
+from pathlib import Path
+
+# 1. Identifica a pasta raiz do projeto de forma dinâmica
+# Como o script está em src/, o parent dele é a raiz do projeto
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 2. Define os caminhos das pastas de dados
+INPUT_DIR = BASE_DIR / "data" / "input"
+OUTPUT_DIR = BASE_DIR / "data" / "output"
+
+# 3. Busca automaticamente arquivos KML ou KMZ na pasta de entrada
+arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
+
+if not arquivos_kml:
+    print("Erro: Nenhum arquivo KML ou KMZ encontrado em data/input/")
+    sys.exit()
+
+# Seleciona o primeiro arquivo encontrado para processamento
+arquivo_projeto = arquivos_kml[0]
+nome_projeto = arquivo_projeto.stem # Pega o nome sem a extensão (ex: "Expansão Centro")
+
+# Lê as configurações globais do projeto
+CONFIG_FILE = BASE_DIR / "config.json"
+with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+    CONFIG = json.load(f)
+
+print(f"Iniciando processamento do projeto: {nome_projeto}")
 
 KML_NS = 'http://www.opengis.net/kml/2.2'
 ET.register_namespace('', KML_NS)
 
-CACHE_CASAS = "casas_detectadas_cache.json"
+# Salva o cache de casas detectadas na pasta de output
+CACHE_CASAS = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
 
 def carregar_casas_cache():
     if not os.path.exists(CACHE_CASAS):
@@ -142,8 +167,30 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos=46, total_pons=
 
     # Exportar os KMLs
     print("\n📦 Exportando elementos de rede...")
-    criar_kml_pontos("Caixas de Terminação Óptica (CTO).kml", "CTOs Posicionadas", lista_ctos)
-    criar_kml_pontos("Caixas de Emenda Óptica (CEO).kml", "CEOs Posicionadas", lista_ceos)
+    caminho_ctos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Terminação Óptica (CTO).kml"
+    caminho_ceos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Emenda Óptica (CEO).kml"
+
+    criar_kml_pontos(caminho_ctos, "CTOs Posicionadas", lista_ctos)
+    criar_kml_pontos(caminho_ceos, "CEOs Posicionadas", lista_ceos)
 
 if __name__ == "__main__":
-    executar_posicionamento_inteligente("Expansão BHS.kml", total_ctos=46, total_pons=6)
+    caminho_dados = OUTPUT_DIR / f"{nome_projeto}_dados_calculados.json"
+    
+    if not os.path.exists(caminho_dados):
+        print(f"❌ Arquivo de cálculos '{caminho_dados}' não encontrado.")
+        print("Execute 'contagem_hp_ai.py' primeiro!")
+        sys.exit()
+        
+    with open(caminho_dados, 'r', encoding='utf-8') as f:
+        dados = json.load(f)
+        
+    olt = CONFIG['equipamentos']['nome_olt_padrao']
+        
+    print(f"Lendo parâmetros calculados: {dados['ctos']} CTOs e {dados['pons']} PONs.")
+    
+    executar_posicionamento_inteligente(
+        str(arquivo_projeto), 
+        total_ctos=dados['ctos'], 
+        total_pons=dados['pons'],
+        no_olt=olt
+    )

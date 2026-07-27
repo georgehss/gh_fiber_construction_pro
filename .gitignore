@@ -1,3 +1,15 @@
 .venv
+Backup/
 Expansão BHS.kml
 Expansão BHS.kmz
+
+# Ignorar arquivos KML/KMZ e relatorios de projetos especificos
+data/input/*
+!data/input/.gitkeep
+data/output/*
+!data/output/.gitkeep
+
+# Ignorar cache de execucao do Python
+__pycache__/
+*.pyc
+*.pyo
