@@ -2,6 +2,7 @@
 Backup/
 Expansão BHS.kml
 Expansão BHS.kmz
+contar_hp_ai.py
 
 # Ignorar arquivos KML/KMZ e relatorios de projetos especificos
 data/input/*
