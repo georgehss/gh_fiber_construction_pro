@@ -11,8 +11,8 @@
         "nome_olt_padrao": "N70"
     },
     "api": {
-        "overpass_timeout_segundos": 30,
-        "overpass_retry_max": 3
+        "overpass_timeout_segundos": 60,
+        "overpass_retry_max": 5
     },
     "cache": {
         "versao": "1.0",

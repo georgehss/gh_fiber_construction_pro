@@ -100,30 +100,43 @@ def criar_sessao_com_retry():
 
 
 def baixar_linhas_ruas(bbox):
-    """Com timeout e retry"""
+    """Com timeout, retry e query otimizada"""
     logger.info("🛣️ Obtendo malha viária...")
 
     min_lon, min_lat, max_lon, max_lat = bbox
+    
+    # ✅ QUERY CORRIGIDA:
+    # - Timeout aumentado para 60s (era 30s)
+    # - Parênteses ao redor da query
+    # - Múltiplas formas de rua para melhor cobertura
     overpass_query = f"""
-    [out:json][timeout:30];
-    way["highway"]({min_lat},{min_lon},{max_lat},{max_lon});
-    out geometry;
-    """
+[out:json][timeout:60];
+(
+  way["highway"]({min_lat},{min_lon},{max_lat},{max_lon});
+  way["junction"]({min_lat},{min_lon},{max_lat},{max_lon});
+);
+out geom;
+"""
 
     url = "https://overpass-api.de/api/interpreter"
     timeout = CONFIG['api']['overpass_timeout_segundos']
-    headers = {'User-Agent': 'FTTH_Snapper/2.0'}
+    headers = {
+        'User-Agent': 'FTTH_Snapper/2.0',
+        'Accept': 'application/json'
+    }
 
     linhas_ruas = []
 
     try:
         # Usar sessão com retry
         sessao = criar_sessao_com_retry()
+        logger.debug(f"📤 Enviando query Overpass com timeout={timeout}s")
+        
         res = sessao.post(
             url, 
             data={'data': overpass_query}, 
             headers=headers,
-            timeout=timeout  # Adicionar timeout
+            timeout=timeout + 5  # Timeout do requests um pouco maior que da query
         )
         res.raise_for_status()  # Verificar status HTTP
 
@@ -140,8 +153,17 @@ def baixar_linhas_ruas(bbox):
         return MultiLineString(linhas_ruas) if linhas_ruas else None
 
     except requests.exceptions.Timeout:
-        logger.warning("⚠️ Timeout na API Overpass (>30s)")
-        logger.info("   CTOs serão posicionados no centro das quadras")
+        logger.warning("⚠️ Timeout na API Overpass (>60s)")
+        logger.info("   Dica: Aumentar 'overpass_timeout_segundos' em config.json")
+        logger.info("   Continuando com centróides das quadras")
+        return None
+
+    except requests.exceptions.HTTPError as e:
+        logger.warning(f"⚠️ Erro HTTP ao obter vias: {e}")
+        if res.status_code == 400:
+            logger.info("   Status 400 (Bad Request) - possível problema na query")
+            logger.debug(f"   Query enviada: {overpass_query}")
+        logger.info("   Continuando com centróides das quadras")
         return None
 
     except requests.exceptions.RequestException as e:
