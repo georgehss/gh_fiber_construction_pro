@@ -1,11 +1,22 @@
 {
+    "versao": "2.0",
     "engenharia": {
         "penetracao_estimada": 0.50,
         "capacidade_splitter_cto": 8,
         "ctos_por_pon": 8,
-        "pons_por_ceo": 2
+        "pons_por_ceo": 2,
+        "distancia_maxima_snap_metros": 50
     },
     "equipamentos": {
         "nome_olt_padrao": "N70"
+    },
+    "api": {
+        "overpass_timeout_segundos": 30,
+        "overpass_retry_max": 3
+    },
+    "cache": {
+        "versao": "1.0",
+        "expirar_dias": 30
     }
 }
+

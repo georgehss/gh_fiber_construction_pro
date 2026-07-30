@@ -1,16 +1,43 @@
+# Específicos do projeto
 .venv
-Backup/
+backup/
 Expansão BHS.kml
 Expansão BHS.kmz
 contar_hp_ai.py
+docs/
 
-# Ignorar arquivos KML/KMZ e relatorios de projetos especificos
-data/input/*
-!data/input/.gitkeep
-data/output/*
-!data/output/.gitkeep
-
-# Ignorar cache de execucao do Python
+# Cache
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Projeto
+data/input/*.kml
+data/input/*.kmz
+data/output/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project

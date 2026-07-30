@@ -1,32 +1,44 @@
 import xml.etree.ElementTree as ET
-import math, os, json, sys, overturemaps
+import math, os, json, sys, overturemaps, logging
 from shapely.geometry import Polygon
 from shapely import wkb
 from pathlib import Path
+from config_validator import ConfigValidator
+from logger_config import configurar_logger
 
-# 1. Identifica a pasta raiz do projeto de forma dinâmica
+
+# Identifica a pasta raiz do projeto de forma dinâmica
 # Como o script está em src/, o parent dele é a raiz do projeto
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# 2. Define os caminhos das pastas de dados
+# Define os caminhos das pastas de dados
 INPUT_DIR = BASE_DIR / "data" / "input"
 OUTPUT_DIR = BASE_DIR / "data" / "output"
-
-# 3. Busca automaticamente arquivos KML ou KMZ na pasta de entrada
-arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
-
-if not arquivos_kml:
-    print("Erro: Nenhum arquivo KML ou KMZ encontrado em data/input/")
-    sys.exit()
-
-# Seleciona o primeiro arquivo encontrado para processamento
-arquivo_projeto = arquivos_kml[0]
-nome_projeto = arquivo_projeto.stem # Pega o nome sem a extensão (ex: "Expansão Centro")
-
-# Lê as configurações globais do projeto
 CONFIG_FILE = BASE_DIR / "config.json"
-with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-    CONFIG = json.load(f)
+
+# Validar config
+try:
+    CONFIG = ConfigValidator.validar(CONFIG_FILE)
+except (ValueError, FileNotFoundError) as e:
+    print(f"❌ Erro na configuração: {e}")
+    sys.exit(1)
+
+
+# Configurar logging
+arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
+if not arquivos_kml:
+    print("❌ Erro: Nenhum arquivo KML/KMZ em data/input/")
+    sys.exit(1)
+
+arquivo_projeto = arquivos_kml[0]
+nome_projeto = arquivo_projeto.stem
+logger = configurar_logger(OUTPUT_DIR, nome_projeto)
+
+# Avisar se houver múltiplos KMLs
+if len(arquivos_kml) > 1:
+    logger.warning(f"⚠️ Encontrados {len(arquivos_kml)} arquivos KML!")
+    logger.warning(f"   Usando: {arquivo_projeto.name}")
+    logger.warning(f"   Ignorando: {', '.join([f.name for f in arquivos_kml[1:]])}")
 
 print(f"Iniciando processamento do projeto: {nome_projeto}")
 
@@ -68,44 +80,44 @@ def extrair_poligonos_kml(caminho_kml):
     return poligonos
 
 def obter_posicoes_casas(bbox, poly_geom):
-    """
-    Verifica se já existe o cache local no computador.
-    Se não existir, baixa da Overture IA e salva o arquivo JSON e o KML.
-    """
-    if os.path.exists(CACHE_CASAS):
-        print(f"   ⚡ Cache local encontrado ('{CACHE_CASAS}')! Carregando do disco...")
-        with open(CACHE_CASAS, 'r', encoding='utf-8') as f:
+    """Baixa casas da Overture com tratamento de erro melhorado"""
+    cache_file = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
+
+    if os.path.exists(cache_file):
+        logger.info(f"⚡ Cache local encontrado: {cache_file.name}")
+        with open(cache_file, 'r', encoding='utf-8') as f:
             pontos = json.load(f)
+        logger.info(f" {len(pontos)} casas carregadas do cache")
         return pontos
 
-    print("   🌐 Baixando telhados da nuvem (Overture Maps IA)...")
-    pontos_casas = []
+    logger.info("🌐 Baixando edificações da nuvem (Overture Maps)...")
+
     try:
+        # Timeout e retry
+        timeout = CONFIG['api']['overture_timeout_segundos']
         reader = overturemaps.record_batch_reader("building", bbox=bbox)
         table = reader.read_all()
         df = table.to_pandas()
-        
+
+        pontos_casas = []
         if not df.empty:
             for geometry_bytes in df['geometry']:
                 geom_building = wkb.loads(geometry_bytes)
                 centroid = geom_building.centroid
-                
+
                 if poly_geom.contains(centroid):
                     pontos_casas.append([round(centroid.x, 6), round(centroid.y, 6)])
-                    
-        # Salva o arquivo de cache JSON
-        with open(CACHE_CASAS, 'w', encoding='utf-8') as f:
+
+        # Salvar cache
+        with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(pontos_casas, f, indent=2)
-        print(f"   💾 Cache criado com sucesso: '{CACHE_CASAS}' ({len(pontos_casas)} casas)")
-        
-        # Cria também um KML visual das casas para abrir no QGIS/Google Earth
-        caminho_kml_casas = OUTPUT_DIR / f"{nome_projeto} - 0.0. Residencias (HP Detectadas).kml"
-        gerar_kml_casas(caminho_kml_casas, pontos_casas)
-        
+
+        logger.info(f"💾 Cache criado: {len(pontos_casas)} casas detectadas")
         return pontos_casas
+
     except Exception as e:
-        print(f"   ❌ Erro durante o download: {e}")
-        return []
+        logger.error(f"❌ Erro ao baixar edificações: {e}", exc_info=True)
+        raise
 
 def gerar_kml_casas(nome_arquivo, pontos):
     kml = ET.Element(f'{{{KML_NS}}}kml')
@@ -138,7 +150,12 @@ def calcular_ftth(hp):
     ctos = math.ceil(hc / cap_cto)
     pons = math.ceil(ctos / cap_pon)
     ceos = math.ceil(pons / cap_ceo)
-    return hc, ctos, pons, ceos
+    return {
+        "hc": hc,
+        "ctos": ctos,
+        "pons": pons,
+        "ceos": ceos
+    }
 
 # --- Execução ---
 if __name__ == "__main__":
@@ -159,7 +176,8 @@ if __name__ == "__main__":
             hp = len(casas)
             
             if hp > 0:
-                hc, ctos, pons, ceos = calcular_ftth(hp)
+                dados_calculados = calcular_ftth(hp)
+                hc, ctos, pons, ceos = dados_calculados['hc'], dados_calculados['ctos'], dados_calculados['pons'], dados_calculados['ceos']
                 print(f"\n🏠 HP (Telhados detectados por IA): {hp}")
                 print(f"🎯 HC (Penetração 50%):             {hc}")
                 print(f"📦 CTOs Necessárias (1x8):           {ctos}")
