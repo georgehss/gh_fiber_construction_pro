@@ -16,37 +16,8 @@ INPUT_DIR = BASE_DIR / "data" / "input"
 OUTPUT_DIR = BASE_DIR / "data" / "output"
 CONFIG_FILE = BASE_DIR / "config.json"
 
-# Validar config
-try:
-    CONFIG = ConfigValidator.validar(CONFIG_FILE)
-except (ValueError, FileNotFoundError) as e:
-    print(f"❌ Erro na configuração: {e}")
-    sys.exit(1)
-
-
-# Configurar logging
-arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
-if not arquivos_kml:
-    print("❌ Erro: Nenhum arquivo KML/KMZ em data/input/")
-    sys.exit(1)
-
-arquivo_projeto = arquivos_kml[0]
-nome_projeto = arquivo_projeto.stem
-logger = configurar_logger(OUTPUT_DIR, nome_projeto)
-
-# Avisar se houver múltiplos KMLs
-if len(arquivos_kml) > 1:
-    logger.warning(f"⚠️ Encontrados {len(arquivos_kml)} arquivos KML!")
-    logger.warning(f"   Usando: {arquivo_projeto.name}")
-    logger.warning(f"   Ignorando: {', '.join([f.name for f in arquivos_kml[1:]])}")
-
-print(f"Iniciando processamento do projeto: {nome_projeto}")
-
 KML_NS = 'http://www.opengis.net/kml/2.2'
 ET.register_namespace('', KML_NS)
-
-# Salva o cache de casas detectadas na pasta de output
-CACHE_CASAS = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
 
 def extrair_poligonos_kml(caminho_kml):
     tree = ET.parse(caminho_kml)
@@ -79,7 +50,7 @@ def extrair_poligonos_kml(caminho_kml):
                 
     return poligonos
 
-def obter_posicoes_casas(bbox, poly_geom):
+def obter_posicoes_casas(bbox, poly_geom, nome_projeto, logger, CONFIG):
     """Baixa casas da Overture com tratamento de erro melhorado"""
     cache_file = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
 
@@ -93,8 +64,7 @@ def obter_posicoes_casas(bbox, poly_geom):
     logger.info("🌐 Baixando edificações da nuvem (Overture Maps)...")
 
     try:
-        # Timeout e retry
-        timeout = CONFIG['api']['overture_timeout_segundos']
+        # Se não achar no config.json, assume 60 segundos por padrão e segue a vida
         reader = overturemaps.record_batch_reader("building", bbox=bbox)
         table = reader.read_all()
         df = table.to_pandas()
@@ -108,7 +78,6 @@ def obter_posicoes_casas(bbox, poly_geom):
                 if poly_geom.contains(centroid):
                     pontos_casas.append([round(centroid.x, 6), round(centroid.y, 6)])
 
-        # Salvar cache
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(pontos_casas, f, indent=2)
 
@@ -139,7 +108,7 @@ def gerar_kml_casas(nome_arquivo, pontos):
     tree.write(nome_arquivo, encoding='utf-8', xml_declaration=True)
     print(f"   📄 KML com marcadores das casas salvo em: '{nome_arquivo}'")
 
-def calcular_ftth(hp):
+def calcular_ftth(hp, CONFIG):
     eng = CONFIG['engenharia']
     penetracao = eng['penetracao_estimada']
     cap_cto = eng['capacidade_splitter_cto']
@@ -157,12 +126,32 @@ def calcular_ftth(hp):
         "ceos": ceos
     }
 
-# --- Execução ---
-if __name__ == "__main__":
-    # Usa o arquivo KML/KMZ encontrado automaticamente na pasta data/input/
+def executar():
+    try:
+        CONFIG = ConfigValidator.validar(CONFIG_FILE)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"❌ Erro na configuração: {e}")
+        return
+
+    arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
+    if not arquivos_kml:
+        print("❌ Erro: Nenhum arquivo KML/KMZ em data/input/")
+        return
+
+    arquivo_projeto = arquivos_kml[0]
+    nome_projeto = arquivo_projeto.stem
+    logger = configurar_logger(OUTPUT_DIR, nome_projeto)
+
+    if len(arquivos_kml) > 1:
+        logger.warning(f"⚠️ Encontrados {len(arquivos_kml)} arquivos KML!")
+        logger.warning(f"   Usando: {arquivo_projeto.name}")
+        logger.warning(f"   Ignorando: {', '.join([f.name for f in arquivos_kml[1:]])}")
+
+    print(f"Iniciando processamento do projeto: {nome_projeto}")
+
     arquivo_kml = str(arquivo_projeto)
-    
     print("🔍 Lendo polígonos do KML...")
+    
     try:
         poligonos = extrair_poligonos_kml(arquivo_kml)
         print(f"Encontrados {len(poligonos)} polígonos no arquivo.\n")
@@ -172,11 +161,13 @@ if __name__ == "__main__":
             print(f"📍 Polígono #{idx}: {poli['nome']}")
             print("==========================================")
             
-            casas = obter_posicoes_casas(poli['bbox'], poli['geom'])
+            # AJUSTE 3: Passando as variáveis criadas aqui dentro para a função lá em cima
+            casas = obter_posicoes_casas(poli['bbox'], poli['geom'], nome_projeto, logger, CONFIG)
             hp = len(casas)
             
             if hp > 0:
-                dados_calculados = calcular_ftth(hp)
+                # AJUSTE 4: Passando o CONFIG
+                dados_calculados = calcular_ftth(hp, CONFIG)
                 hc, ctos, pons, ceos = dados_calculados['hc'], dados_calculados['ctos'], dados_calculados['pons'], dados_calculados['ceos']
                 print(f"\n🏠 HP (Telhados detectados por IA): {hp}")
                 print(f"🎯 HC (Penetração 50%):             {hc}")
@@ -184,7 +175,6 @@ if __name__ == "__main__":
                 print(f"⚡ PONs Necessárias:                 {pons}")
                 print(f"🔀 CEOs Necessárias:     {ceos}\n")
 
-                # Salva os cálculos para o script de posicionamento ler depois
                 dados_projeto = {
                     "hp": hp,
                     "hc": hc,
@@ -198,8 +188,9 @@ if __name__ == "__main__":
 
             else:
                 print("⚠️ Nenhuma edificação foi detectada dentro deste polígono.\n")
-
-            
-                
+        
     except FileNotFoundError:
         print(f"❌ Arquivo '{arquivo_kml}' não foi encontrado.")
+
+if __name__ == "__main__":
+    executar()

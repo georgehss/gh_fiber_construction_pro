@@ -12,6 +12,7 @@
     },
     "api": {
         "overpass_timeout_segundos": 60,
+        "overture_timeout_segundos": 60,
         "overpass_retry_max": 5
     },
     "cache": {

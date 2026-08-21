@@ -18,43 +18,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 INPUT_DIR = BASE_DIR / "data" / "input"
 OUTPUT_DIR = BASE_DIR / "data" / "output"
 
-# Busca automaticamente arquivos KML ou KMZ na pasta de entrada
-arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
-
-if not arquivos_kml:
-    print("❌ Erro: Nenhum arquivo KML/KMZ em data/input/")
-    sys.exit(1)
-
-# Seleciona o primeiro arquivo encontrado para processamento
-arquivo_projeto = arquivos_kml[0]
-nome_projeto = arquivo_projeto.stem # Pega o nome sem a extensão (ex: "Expansão Centro")
-
-# Configurar logging PRIMEIRO
-logger = configurar_logger(OUTPUT_DIR, nome_projeto)
-
-# Validar config com ConfigValidator
+# AJUSTE 1: Adicionado o caminho do config que estava faltando no escopo global
 CONFIG_FILE = BASE_DIR / "config.json"
-try:
-    CONFIG = ConfigValidator.validar(CONFIG_FILE)
-except (ValueError, FileNotFoundError) as e:
-    logger.error(f"❌ Erro na configuração: {e}")
-    sys.exit(1)
-
-logger.info(f"Iniciando processamento do projeto: {nome_projeto}")
-
-# Avisar se houver múltiplos KMLs
-if len(arquivos_kml) > 1:
-    logger.warning(f"⚠️ Encontrados {len(arquivos_kml)} arquivos KML!")
-    logger.warning(f"   Usando: {arquivo_projeto.name}")
-    logger.warning(f"   Ignorando: {', '.join([f.name for f in arquivos_kml[1:]])}")
 
 KML_NS = 'http://www.opengis.net/kml/2.2'
 ET.register_namespace('', KML_NS)
 
-# Salva o cache de casas detectadas na pasta de output
-CACHE_CASAS = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
 
-def carregar_casas_cache():
+# AJUSTE 2: Recebendo nome_projeto e logger como parâmetros
+def carregar_casas_cache(nome_projeto, logger):
+    # Movendo a definição do CACHE_CASAS para cá, onde temos o nome_projeto
+    CACHE_CASAS = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
+    
     if not os.path.exists(CACHE_CASAS):
         raise FileNotFoundError(f"❌ Cache '{CACHE_CASAS}' não encontrado! Rode primeiro o script 'contagem_hp_ai.py'.")
     
@@ -98,17 +73,13 @@ def criar_sessao_com_retry():
 
     return sessao
 
-
-def baixar_linhas_ruas(bbox):
+# AJUSTE 3: Recebendo logger e CONFIG
+def baixar_linhas_ruas(bbox, logger, CONFIG):
     """Com timeout, retry e query otimizada"""
     logger.info("🛣️ Obtendo malha viária...")
 
     min_lon, min_lat, max_lon, max_lat = bbox
     
-    # ✅ QUERY CORRIGIDA:
-    # - Timeout aumentado para 60s (era 30s)
-    # - Parênteses ao redor da query
-    # - Múltiplas formas de rua para melhor cobertura
     overpass_query = f"""
 [out:json][timeout:60];
 (
@@ -128,7 +99,6 @@ out geom;
     linhas_ruas = []
 
     try:
-        # Usar sessão com retry
         sessao = criar_sessao_com_retry()
         logger.debug(f"📤 Enviando query Overpass com timeout={timeout}s")
         
@@ -136,9 +106,9 @@ out geom;
             url, 
             data={'data': overpass_query}, 
             headers=headers,
-            timeout=timeout + 5  # Timeout do requests um pouco maior que da query
+            timeout=timeout + 5 
         )
-        res.raise_for_status()  # Verificar status HTTP
+        res.raise_for_status()
 
         data = res.json()
         elemento_count = len(data.get('elements', []))
@@ -171,14 +141,14 @@ out geom;
         logger.info("   Continuando com centróides das quadras")
         return None
 
-
 def alinhar_ponto_na_rua(ponto, malha_viaria):
     if malha_viaria is None:
         return ponto.x, ponto.y
     pt_proximo = nearest_points(malha_viaria, ponto)[0]
     return pt_proximo.x, pt_proximo.y
 
-def criar_kml_pontos(nome_arquivo, pasta_nome, pontos):
+# AJUSTE 4: Recebendo logger
+def criar_kml_pontos(nome_arquivo, pasta_nome, pontos, logger):
     kml = ET.Element(f'{{{KML_NS}}}kml')
     doc = ET.SubElement(kml, f'{{{KML_NS}}}Document')
     folder = ET.SubElement(doc, f'{{{KML_NS}}}Folder')
@@ -198,14 +168,18 @@ def criar_kml_pontos(nome_arquivo, pasta_nome, pontos):
     tree.write(nome_arquivo, encoding='utf-8', xml_declaration=True)
     logger.info(f"KML '{nome_arquivo}' gerado com sucesso!")
 
-def executar_posicionamento_inteligente(kml_poligono, total_ctos=46, total_pons=6, no_olt="N70"):
+
+# AJUSTE 5: Recebendo todas as instâncias e variáveis de contexto da função principal
+def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no_olt, nome_projeto, logger, CONFIG):
     """Com melhor nomeação e validação"""
 
-    casas_coords = carregar_casas_cache()
+    # Repassando o nome_projeto e logger para o cache
+    casas_coords = carregar_casas_cache(nome_projeto, logger)
     bbox = extrair_bbox_poligono(kml_poligono)
-    malha_viaria = baixar_linhas_ruas(bbox)
+    
+    # Repassando o logger e o CONFIG para as requisições de ruas
+    malha_viaria = baixar_linhas_ruas(bbox, logger, CONFIG)
 
-    # Validar K-Means
     if len(casas_coords) < total_ctos:
         logger.warning(f"⚠️ Casas ({len(casas_coords)}) < CTOs ({total_ctos})")
         logger.info("   Ajustando número de CTOs...")
@@ -217,12 +191,11 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos=46, total_pons=
     kmeans.fit(casas_coords)
     centros_grupos = kmeans.cluster_centers_
 
-    # Melhor alocação
     lista_ctos = []
 
     for idx_cto, (centro_x, centro_y) in enumerate(centros_grupos):
-        pon_num = (idx_cto // 8) + 1  # Qual PON
-        ss_num = (idx_cto % 8) + 1     # Qual SubSlot
+        pon_num = (idx_cto // 8) + 1  
+        ss_num = (idx_cto % 8) + 1     
 
         lon_rua, lat_rua = alinhar_ponto_na_rua(
             Point(centro_x, centro_y), 
@@ -234,7 +207,6 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos=46, total_pons=
         logger.debug(f"  CTO {nome_cto}: ({lon_rua:.4f}, {lat_rua:.4f})")
 
 
-    # 4. Aloca CEOs
     total_ceos = math.ceil(total_pons / 2)
     cto_pts = np.array([(c[1], c[2]) for c in lista_ctos])
     
@@ -253,35 +225,63 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos=46, total_pons=
         lon_rua, lat_rua = alinhar_ponto_na_rua(Point(c_x, c_y), malha_viaria)
         lista_ceos.append((nome_ceo, round(lon_rua, 6), round(lat_rua, 6)))
 
-    # Exportar os KMLs
     logger.info("📦 Exportando elementos de rede...")
     caminho_ctos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Terminação Óptica (CTO).kml"
     caminho_ceos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Emenda Óptica (CEO).kml"
 
-    criar_kml_pontos(caminho_ctos, "CTOs Posicionadas", lista_ctos)
-    criar_kml_pontos(caminho_ceos, "CEOs Posicionadas", lista_ceos)
+    # Repassando o logger para a criação do KML
+    criar_kml_pontos(caminho_ctos, "CTOs Posicionadas", lista_ctos, logger)
+    criar_kml_pontos(caminho_ceos, "CEOs Posicionadas", lista_ceos, logger)
     
     logger.info(f"✅ {len(lista_ctos)} CTOs posicionadas com sucesso")
 
 
-if __name__ == "__main__":
+def executar():
+    try:
+        CONFIG = ConfigValidator.validar(CONFIG_FILE)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"❌ Erro na configuração: {e}")
+        return
+
+    arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
+    if not arquivos_kml:
+        print("❌ Erro: Nenhum arquivo KML/KMZ em data/input/")
+        return
+
+    arquivo_projeto = arquivos_kml[0]
+    nome_projeto = arquivo_projeto.stem
+    logger = configurar_logger(OUTPUT_DIR, nome_projeto)
+    
+    logger.info(f"Iniciando processamento do projeto: {nome_projeto}")
+    
+    if len(arquivos_kml) > 1:
+        logger.warning(f"⚠️ Encontrados {len(arquivos_kml)} arquivos KML!")
+        logger.warning(f"   Usando: {arquivo_projeto.name}")
+        logger.warning(f"   Ignorando: {', '.join([f.name for f in arquivos_kml[1:]])}")
+    
     caminho_dados = OUTPUT_DIR / f"{nome_projeto}_dados_calculados.json"
     
     if not os.path.exists(caminho_dados):
         logger.error(f"Arquivo de cálculos '{caminho_dados}' não encontrado.")
         logger.info("Execute 'contagem_hp_ai.py' primeiro!")
-        sys.exit(1)
+        return 
         
     with open(caminho_dados, 'r', encoding='utf-8') as f:
         dados = json.load(f)
         
     olt = CONFIG['equipamentos']['nome_olt_padrao']
-        
     logger.info(f"Lendo parâmetros calculados: {dados['ctos']} CTOs e {dados['pons']} PONs.")
     
+    # AJUSTE 6: Chamando a função e entregando as variáveis
     executar_posicionamento_inteligente(
-        str(arquivo_projeto), 
+        kml_poligono=str(arquivo_projeto), 
         total_ctos=dados['ctos'], 
         total_pons=dados['pons'],
-        no_olt=olt
+        no_olt=olt,
+        nome_projeto=nome_projeto,
+        logger=logger,
+        CONFIG=CONFIG
     )
+
+if __name__ == "__main__":
+    executar()

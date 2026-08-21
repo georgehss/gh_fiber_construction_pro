@@ -6,13 +6,6 @@ from datetime import datetime
 def configurar_logger(output_dir: Path, nome_projeto: str) -> logging.Logger:
     """
     Configura logging estruturado
-
-    Args:
-        output_dir: Diretório onde salvar logs
-        nome_projeto: Nome do projeto para identificação
-
-    Returns:
-        Logger configurado
     """
     # Criar diretório de logs se não existir
     log_dir = output_dir / "logs"
@@ -25,6 +18,10 @@ def configurar_logger(output_dir: Path, nome_projeto: str) -> logging.Logger:
     # Criar logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
+
+    # AJUSTE: Limpar handlers antigos se existirem, para evitar duplicação!
+    if logger.hasHandlers():
+        logger.handlers.clear()
 
     # Handler para arquivo
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
