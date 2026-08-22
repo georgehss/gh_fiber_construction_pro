@@ -231,7 +231,7 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no
     logger.info("📦 Exportando elementos de rede...")
     
     # --- Cores dos Ícones do Google Earth ---
-    ICONE_CTO = "http://maps.google.com/mapfiles/kml/pushpin/green-pushpin.png"
+    ICONE_CTO = "http://maps.google.com/mapfiles/kml/pushpin/blue-pushpin.png"
     ICONE_CEO = "http://maps.google.com/mapfiles/kml/pushpin/red-pushpin.png"
 
     caminho_ctos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Terminação Óptica (CTO).kml"
