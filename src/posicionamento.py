@@ -10,24 +10,19 @@ from urllib3.util.retry import Retry
 from config_validator import ConfigValidator
 from logger_config import configurar_logger
 
-
 # Identifica a pasta raiz do projeto de forma dinâmica
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Define os caminhos das pastas de dados
 INPUT_DIR = BASE_DIR / "data" / "input"
 OUTPUT_DIR = BASE_DIR / "data" / "output"
-
-# AJUSTE 1: Adicionado o caminho do config que estava faltando no escopo global
 CONFIG_FILE = BASE_DIR / "config.json"
 
 KML_NS = 'http://www.opengis.net/kml/2.2'
 ET.register_namespace('', KML_NS)
 
 
-# AJUSTE 2: Recebendo nome_projeto e logger como parâmetros
 def carregar_casas_cache(nome_projeto, logger):
-    # Movendo a definição do CACHE_CASAS para cá, onde temos o nome_projeto
     CACHE_CASAS = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
     
     if not os.path.exists(CACHE_CASAS):
@@ -57,27 +52,20 @@ def extrair_bbox_poligono(caminho_kml):
     return poly.bounds
 
 def criar_sessao_com_retry():
-    """Cria sessão HTTP com retry automático"""
     sessao = requests.Session()
-
     retry_strategy = Retry(
         total=3,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "POST"]
     )
-
     adapter = HTTPAdapter(max_retries=retry_strategy)
     sessao.mount("http://", adapter)
     sessao.mount("https://", adapter)
-
     return sessao
 
-# AJUSTE 3: Recebendo logger e CONFIG
 def baixar_linhas_ruas(bbox, logger, CONFIG):
-    """Com timeout, retry e query otimizada"""
     logger.info("🛣️ Obtendo malha viária...")
-
     min_lon, min_lat, max_lon, max_lat = bbox
     
     overpass_query = f"""
@@ -90,29 +78,17 @@ out geom;
 """
 
     url = "https://overpass-api.de/api/interpreter"
-    timeout = CONFIG['api']['overpass_timeout_segundos']
-    headers = {
-        'User-Agent': 'FTTH_Snapper/2.0',
-        'Accept': 'application/json'
-    }
-
+    timeout = CONFIG['api'].get('overpass_timeout_segundos', 60)
+    headers = {'User-Agent': 'FTTH_Snapper/2.0', 'Accept': 'application/json'}
     linhas_ruas = []
 
     try:
         sessao = criar_sessao_com_retry()
-        logger.debug(f"📤 Enviando query Overpass com timeout={timeout}s")
-        
-        res = sessao.post(
-            url, 
-            data={'data': overpass_query}, 
-            headers=headers,
-            timeout=timeout + 5 
-        )
+        res = sessao.post(url, data={'data': overpass_query}, headers=headers, timeout=timeout + 5)
         res.raise_for_status()
 
         data = res.json()
-        elemento_count = len(data.get('elements', []))
-        logger.info(f"✅ {elemento_count} elementos de via encontrados")
+        logger.info(f"✅ {len(data.get('elements', []))} elementos de via encontrados")
 
         for elem in data.get('elements', []):
             geom = elem.get('geometry', [])
@@ -121,20 +97,6 @@ out geom;
                 linhas_ruas.append(LineString(coords))
 
         return MultiLineString(linhas_ruas) if linhas_ruas else None
-
-    except requests.exceptions.Timeout:
-        logger.warning("⚠️ Timeout na API Overpass (>60s)")
-        logger.info("   Dica: Aumentar 'overpass_timeout_segundos' em config.json")
-        logger.info("   Continuando com centróides das quadras")
-        return None
-
-    except requests.exceptions.HTTPError as e:
-        logger.warning(f"⚠️ Erro HTTP ao obter vias: {e}")
-        if res.status_code == 400:
-            logger.info("   Status 400 (Bad Request) - possível problema na query")
-            logger.debug(f"   Query enviada: {overpass_query}")
-        logger.info("   Continuando com centróides das quadras")
-        return None
 
     except requests.exceptions.RequestException as e:
         logger.warning(f"⚠️ Erro ao obter vias: {e}")
@@ -147,10 +109,42 @@ def alinhar_ponto_na_rua(ponto, malha_viaria):
     pt_proximo = nearest_points(malha_viaria, ponto)[0]
     return pt_proximo.x, pt_proximo.y
 
-# AJUSTE 4: Recebendo logger
-def criar_kml_pontos(nome_arquivo, pasta_nome, pontos, logger):
+# --- FUNÇÃO CORRIGIDA: Ordenar caixas geograficamente ---
+def ordenar_por_proximidade(pontos):
+    if len(pontos) == 0: return pontos
+    
+    # A MÁGICA AQUI: Converte as matrizes do NumPy para tuplas padrão do Python
+    pontos_lista = [tuple(p) for p in pontos]
+    
+    # Inicia pela caixa mais ao Noroeste (menor longitude, maior latitude)
+    atual = min(pontos_lista, key=lambda p: (p[0], -p[1]))
+    ordenados = [atual]
+    pontos_lista.remove(atual)
+
+    # Vai conectando na caixa mais próxima sucessivamente
+    while pontos_lista:
+        mais_proximo = min(pontos_lista, key=lambda p: math.hypot(p[0]-atual[0], p[1]-atual[1]))
+        ordenados.append(mais_proximo)
+        pontos_lista.remove(mais_proximo)
+        atual = mais_proximo
+
+    return ordenados
+
+# --- Função KML suportando ícones coloridos ---
+def criar_kml_pontos(nome_arquivo, pasta_nome, pontos, logger, url_icone=None):
     kml = ET.Element(f'{{{KML_NS}}}kml')
     doc = ET.SubElement(kml, f'{{{KML_NS}}}Document')
+    
+    # Define o estilo visual (Tachão Colorido)
+    if url_icone:
+        style = ET.SubElement(doc, f'{{{KML_NS}}}Style', id="estiloPersonalizado")
+        icon_style = ET.SubElement(style, f'{{{KML_NS}}}IconStyle')
+        scale = ET.SubElement(icon_style, f'{{{KML_NS}}}scale')
+        scale.text = "1.2" # Um pouco maior pra destacar
+        icon = ET.SubElement(icon_style, f'{{{KML_NS}}}Icon')
+        href = ET.SubElement(icon, f'{{{KML_NS}}}href')
+        href.text = url_icone
+
     folder = ET.SubElement(doc, f'{{{KML_NS}}}Folder')
     nome_folder = ET.SubElement(folder, f'{{{KML_NS}}}name')
     nome_folder.text = pasta_nome
@@ -159,6 +153,11 @@ def criar_kml_pontos(nome_arquivo, pasta_nome, pontos, logger):
         pm = ET.SubElement(folder, f'{{{KML_NS}}}Placemark')
         p_name = ET.SubElement(pm, f'{{{KML_NS}}}name')
         p_name.text = nome
+        
+        # Aplica a cor
+        if url_icone:
+            style_url = ET.SubElement(pm, f'{{{KML_NS}}}styleUrl')
+            style_url.text = "#estiloPersonalizado"
         
         point = ET.SubElement(pm, f'{{{KML_NS}}}Point')
         coords = ET.SubElement(point, f'{{{KML_NS}}}coordinates')
@@ -169,71 +168,80 @@ def criar_kml_pontos(nome_arquivo, pasta_nome, pontos, logger):
     logger.info(f"KML '{nome_arquivo}' gerado com sucesso!")
 
 
-# AJUSTE 5: Recebendo todas as instâncias e variáveis de contexto da função principal
 def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no_olt, nome_projeto, logger, CONFIG):
-    """Com melhor nomeação e validação"""
-
-    # Repassando o nome_projeto e logger para o cache
     casas_coords = carregar_casas_cache(nome_projeto, logger)
     bbox = extrair_bbox_poligono(kml_poligono)
-    
-    # Repassando o logger e o CONFIG para as requisições de ruas
     malha_viaria = baixar_linhas_ruas(bbox, logger, CONFIG)
 
     if len(casas_coords) < total_ctos:
         logger.warning(f"⚠️ Casas ({len(casas_coords)}) < CTOs ({total_ctos})")
-        logger.info("   Ajustando número de CTOs...")
         total_ctos = max(1, len(casas_coords) // 2)
 
     logger.info(f"🧠 K-Means: {len(casas_coords)} casas → {total_ctos} CTOs")
-
+    
+    # 1. Gera os agrupamentos desordenados
     kmeans = KMeans(n_clusters=total_ctos, random_state=42, n_init=20)
     kmeans.fit(casas_coords)
     centros_grupos = kmeans.cluster_centers_
 
+    # 2. Ordena os agrupamentos criando um caminho lógico no mapa
+    centros_ordenados = ordenar_por_proximidade(centros_grupos)
+
     lista_ctos = []
+    lista_ctos_metadata = [] # Para nos ajudar a centralizar as CEOs depois
+    ctos_por_pon = CONFIG['engenharia'].get('ctos_por_pon', 8)
+    pons_por_ceo = CONFIG['engenharia'].get('pons_por_ceo', 2)
 
-    for idx_cto, (centro_x, centro_y) in enumerate(centros_grupos):
-        pon_num = (idx_cto // 8) + 1  
-        ss_num = (idx_cto % 8) + 1     
+    for idx_cto, (centro_x, centro_y) in enumerate(centros_ordenados):
+        pon_num = (idx_cto // ctos_por_pon) + 1  
+        ss_num = (idx_cto % ctos_por_pon) + 1     
 
-        lon_rua, lat_rua = alinhar_ponto_na_rua(
-            Point(centro_x, centro_y), 
-            malha_viaria
-        )
-
+        lon_rua, lat_rua = alinhar_ponto_na_rua(Point(centro_x, centro_y), malha_viaria)
         nome_cto = f"{(idx_cto+1):03d}_{no_olt}_SP{pon_num}_SS{ss_num}"
+        
         lista_ctos.append((nome_cto, round(lon_rua, 6), round(lat_rua, 6)))
+        lista_ctos_metadata.append({"pon": pon_num, "lon": lon_rua, "lat": lat_rua})
         logger.debug(f"  CTO {nome_cto}: ({lon_rua:.4f}, {lat_rua:.4f})")
 
-
-    total_ceos = math.ceil(total_pons / 2)
-    cto_pts = np.array([(c[1], c[2]) for c in lista_ctos])
-    
-    kmeans_ceos = KMeans(n_clusters=total_ceos, random_state=42, n_init=10)
-    kmeans_ceos.fit(cto_pts)
-    centros_ceos = kmeans_ceos.cluster_centers_
-    
+    # 3. Posicionamento Estratégico das CEOs
+    total_ceos = math.ceil(total_pons / pons_por_ceo)
     lista_ceos = []
+    
     for idx_ceo in range(total_ceos):
-        sp_ini = (idx_ceo * 2) + 1
-        sp_fim = min(sp_ini + 1, total_pons)
-        tag_sp = f"SP{sp_ini}-{sp_fim}" if sp_ini != sp_fim else f"SP{sp_ini}"
+        pon_inicial = (idx_ceo * pons_por_ceo) + 1
+        pon_final = min(pon_inicial + pons_por_ceo - 1, total_pons)
         
+        # Filtra apenas as CTOs que esta CEO vai alimentar
+        ctos_da_ceo = [c for c in lista_ctos_metadata if pon_inicial <= c['pon'] <= pon_final]
+        
+        if not ctos_da_ceo:
+            continue
+            
+        # O centro da CEO agora é o centro geométrico exato das suas CTOs
+        media_lon = sum(c['lon'] for c in ctos_da_ceo) / len(ctos_da_ceo)
+        media_lat = sum(c['lat'] for c in ctos_da_ceo) / len(ctos_da_ceo)
+        
+        lon_rua, lat_rua = alinhar_ponto_na_rua(Point(media_lon, media_lat), malha_viaria)
+        
+        tag_sp = f"SP{pon_inicial}-{pon_final}" if pon_inicial != pon_final else f"SP{pon_inicial}"
         nome_ceo = f"{(idx_ceo + 1):02d}_{no_olt}_{tag_sp}"
-        c_x, c_y = centros_ceos[idx_ceo]
-        lon_rua, lat_rua = alinhar_ponto_na_rua(Point(c_x, c_y), malha_viaria)
+        
         lista_ceos.append((nome_ceo, round(lon_rua, 6), round(lat_rua, 6)))
 
     logger.info("📦 Exportando elementos de rede...")
+    
+    # --- Cores dos Ícones do Google Earth ---
+    ICONE_CTO = "http://maps.google.com/mapfiles/kml/pushpin/green-pushpin.png"
+    ICONE_CEO = "http://maps.google.com/mapfiles/kml/pushpin/red-pushpin.png"
+
     caminho_ctos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Terminação Óptica (CTO).kml"
     caminho_ceos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Emenda Óptica (CEO).kml"
 
-    # Repassando o logger para a criação do KML
-    criar_kml_pontos(caminho_ctos, "CTOs Posicionadas", lista_ctos, logger)
-    criar_kml_pontos(caminho_ceos, "CEOs Posicionadas", lista_ceos, logger)
+    # Criando os arquivos KML enviando a respectiva cor de ícone
+    criar_kml_pontos(caminho_ctos, "CTOs Posicionadas", lista_ctos, logger, url_icone=ICONE_CTO)
+    criar_kml_pontos(caminho_ceos, "CEOs Posicionadas", lista_ceos, logger, url_icone=ICONE_CEO)
     
-    logger.info(f"✅ {len(lista_ctos)} CTOs posicionadas com sucesso")
+    logger.info(f"✅ {len(lista_ctos)} CTOs e {len(lista_ceos)} CEOs posicionadas com sucesso!")
 
 
 def executar():
@@ -272,7 +280,6 @@ def executar():
     olt = CONFIG['equipamentos']['nome_olt_padrao']
     logger.info(f"Lendo parâmetros calculados: {dados['ctos']} CTOs e {dados['pons']} PONs.")
     
-    # AJUSTE 6: Chamando a função e entregando as variáveis
     executar_posicionamento_inteligente(
         kml_poligono=str(arquivo_projeto), 
         total_ctos=dados['ctos'], 
