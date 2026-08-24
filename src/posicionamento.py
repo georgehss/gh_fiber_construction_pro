@@ -168,6 +168,48 @@ def criar_kml_pontos(nome_arquivo, pasta_nome, pontos, logger, url_icone=None):
     logger.info(f"KML '{nome_arquivo}' gerado com sucesso!")
 
 
+def criar_kml_linhas(nome_arquivo, pasta_nome, linhas, logger, cor_hex="ff00ffff", largura=2):
+    """
+    Gera um KML contendo LineStrings (Cabos).
+    cor_hex: Formato AABBGGRR (Alpha, Blue, Green, Red). ff00ffff = Amarelo opaco.
+    """
+    kml = ET.Element(f'{{{KML_NS}}}kml')
+    doc = ET.SubElement(kml, f'{{{KML_NS}}}Document')
+    
+    # Estilo da linha
+    style = ET.SubElement(doc, f'{{{KML_NS}}}Style', id="estiloCabo")
+    line_style = ET.SubElement(style, f'{{{KML_NS}}}LineStyle')
+    color = ET.SubElement(line_style, f'{{{KML_NS}}}color')
+    color.text = cor_hex 
+    width = ET.SubElement(line_style, f'{{{KML_NS}}}width')
+    width.text = str(largura)
+
+    folder = ET.SubElement(doc, f'{{{KML_NS}}}Folder')
+    nome_folder = ET.SubElement(folder, f'{{{KML_NS}}}name')
+    nome_folder.text = pasta_nome
+    
+    for linha in linhas:
+        pm = ET.SubElement(folder, f'{{{KML_NS}}}Placemark')
+        p_name = ET.SubElement(pm, f'{{{KML_NS}}}name')
+        p_name.text = linha['nome']
+        
+        style_url = ET.SubElement(pm, f'{{{KML_NS}}}styleUrl')
+        style_url.text = "#estiloCabo"
+        
+        ls = ET.SubElement(pm, f'{{{KML_NS}}}LineString')
+        tessellate = ET.SubElement(ls, f'{{{KML_NS}}}tessellate')
+        tessellate.text = '1' # Permite que a linha acompanhe o relevo do solo
+        coords = ET.SubElement(ls, f'{{{KML_NS}}}coordinates')
+        
+        # Concatena as coordenadas no formato lon,lat,0
+        coords_str = " ".join([f"{lon},{lat},0" for lon, lat in linha['coords']])
+        coords.text = coords_str
+        
+    tree = ET.ElementTree(kml)
+    tree.write(nome_arquivo, encoding='utf-8', xml_declaration=True)
+    logger.info(f"KML de Cabos '{Path(nome_arquivo).name}' gerado com sucesso!")
+
+
 def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no_olt, nome_projeto, logger, CONFIG):
     casas_coords = carregar_casas_cache(nome_projeto, logger)
     bbox = extrair_bbox_poligono(kml_poligono)
@@ -188,7 +230,7 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no
     centros_ordenados = ordenar_por_proximidade(centros_grupos)
 
     lista_ctos = []
-    lista_ctos_metadata = [] # Para nos ajudar a centralizar as CEOs depois
+    lista_ctos_metadata = [] 
     ctos_por_pon = CONFIG['engenharia'].get('ctos_por_pon', 8)
     pons_por_ceo = CONFIG['engenharia'].get('pons_por_ceo', 2)
 
@@ -200,24 +242,25 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no
         nome_cto = f"{(idx_cto+1):03d}_{no_olt}_SP{pon_num}_SS{ss_num}"
         
         lista_ctos.append((nome_cto, round(lon_rua, 6), round(lat_rua, 6)))
-        lista_ctos_metadata.append({"pon": pon_num, "lon": lon_rua, "lat": lat_rua})
+        
+        # MODIFICAÇÃO 1: Adicionando o 'nome' no metadata para nomear o cabo corretamente
+        lista_ctos_metadata.append({"nome": nome_cto, "pon": pon_num, "lon": lon_rua, "lat": lat_rua})
         logger.debug(f"  CTO {nome_cto}: ({lon_rua:.4f}, {lat_rua:.4f})")
 
-    # 3. Posicionamento Estratégico das CEOs
+    # 3. Posicionamento Estratégico das CEOs e Geração dos Cabos
     total_ceos = math.ceil(total_pons / pons_por_ceo)
     lista_ceos = []
+    lista_cabos = [] # MODIFICAÇÃO 2: Lista para armazenar as interligações
     
     for idx_ceo in range(total_ceos):
         pon_inicial = (idx_ceo * pons_por_ceo) + 1
         pon_final = min(pon_inicial + pons_por_ceo - 1, total_pons)
         
-        # Filtra apenas as CTOs que esta CEO vai alimentar
         ctos_da_ceo = [c for c in lista_ctos_metadata if pon_inicial <= c['pon'] <= pon_final]
         
         if not ctos_da_ceo:
             continue
             
-        # O centro da CEO agora é o centro geométrico exato das suas CTOs
         media_lon = sum(c['lon'] for c in ctos_da_ceo) / len(ctos_da_ceo)
         media_lat = sum(c['lat'] for c in ctos_da_ceo) / len(ctos_da_ceo)
         
@@ -228,20 +271,31 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no
         
         lista_ceos.append((nome_ceo, round(lon_rua, 6), round(lat_rua, 6)))
 
+        # MODIFICAÇÃO 3: Criando a linha entre cada CTO e esta CEO
+        for cto in ctos_da_ceo:
+            nome_cabo = f"Cabo_Dist_{cto['nome']}_to_{nome_ceo}"
+            lista_cabos.append({
+                "nome": nome_cabo,
+                # Tupla contendo Ponto A (CTO) e Ponto B (CEO)
+                "coords": [(cto['lon'], cto['lat']), (lon_rua, lat_rua)] 
+            })
+
     logger.info("📦 Exportando elementos de rede...")
     
-    # --- Cores dos Ícones do Google Earth ---
     ICONE_CTO = "http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png"
     ICONE_CEO = "http://maps.google.com/mapfiles/kml/pushpin/red-pushpin.png"
 
     caminho_ctos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Terminação Óptica (CTO).kml"
     caminho_ceos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Emenda Óptica (CEO).kml"
+    caminho_cabos = OUTPUT_DIR / f"{nome_projeto} - Cabos de Distribuição.kml" # Novo arquivo
 
-    # Criando os arquivos KML enviando a respectiva cor de ícone
     criar_kml_pontos(caminho_ctos, "CTOs Posicionadas", lista_ctos, logger, url_icone=ICONE_CTO)
     criar_kml_pontos(caminho_ceos, "CEOs Posicionadas", lista_ceos, logger, url_icone=ICONE_CEO)
     
-    logger.info(f"✅ {len(lista_ctos)} CTOs e {len(lista_ceos)} CEOs posicionadas com sucesso!")
+    # MODIFICAÇÃO 4: Exportando o KML dos Cabos (em Azul ciano = ffffff00)
+    criar_kml_linhas(caminho_cabos, "Cabos de Distribuição", lista_cabos, logger, cor_hex="ffffff00")
+    
+    logger.info(f"✅ {len(lista_ctos)} CTOs, {len(lista_ceos)} CEOs e {len(lista_cabos)} Cabos posicionados com sucesso!")
 
 
 def executar():
