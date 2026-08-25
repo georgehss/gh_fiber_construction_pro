@@ -12,6 +12,9 @@ class ConfigValidator:
         'engenharia.ctos_por_pon': (int, lambda x: x > 0),
         'engenharia.pons_por_ceo': (int, lambda x: x > 0),
         'api.overpass_timeout_segundos': (int, lambda x: x > 0),
+        'opcoes_visuais_e_nomes.nomear_cto_ceo_automaticamente': (bool, lambda x: True),
+        'opcoes_visuais_e_nomes.colorir_cto_por_pon': (bool, lambda x: True),
+        'opcoes_visuais_e_nomes.colorir_cabos_por_pon': (bool, lambda x: True),
     }
 
     @staticmethod

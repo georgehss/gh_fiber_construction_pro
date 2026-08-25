@@ -44,6 +44,49 @@ def extrair_bbox_poligono(caminho_kml):
     poly = Polygon(lista_lon_lat)
     return poly.bounds
 
+def ler_kml_corrigido_pelo_usuario(caminho_arquivo_kml, logger):
+    """
+    Lê o arquivo KML editado no Google Earth e extrai as novas coordenadas das CTOs/CEOs.
+    Retorna uma lista de dicionários com nome, latitude e longitude.
+    """
+    logger.info(f"🔍 Procurando KML editado em: {caminho_arquivo_kml}")
+    if not os.path.exists(caminho_arquivo_kml):
+         logger.info("ℹ️ Nenhum KML editado encontrado. O script usará as posições brutas do algoritmo.")
+         return []
+
+    try:
+        tree = ET.parse(caminho_arquivo_kml)
+        root = tree.getroot()
+        ns = {'kml': KML_NS}
+        
+        elementos_corrigidos = []
+        
+        for placemark in root.findall('.//kml:Placemark', ns):
+            nome_tag = placemark.find('kml:name', ns)
+            ponto_tag = placemark.find('.//kml:Point/kml:coordinates', ns)
+            
+            if nome_tag is not None and ponto_tag is not None:
+                nome = nome_tag.text.strip()
+                coords_str = ponto_tag.text.strip()
+                coords_list = coords_str.split(',')
+                
+                if len(coords_list) >= 2:
+                    lon = float(coords_list[0])
+                    lat = float(coords_list[1])
+                    
+                    elementos_corrigidos.append({
+                        "nome": nome,
+                        "lat": lat,
+                        "lon": lon
+                    })
+                    
+        logger.info(f"✅ Sucesso! {len(elementos_corrigidos)} elementos carregados do KML corrigido.")
+        return elementos_corrigidos
+
+    except Exception as e:
+        logger.warning(f"⚠️ Erro ao ler o KML corrigido: {e}. O sistema ignorará o arquivo.")
+        return []
+
 def criar_sessao_com_retry():
     sessao = requests.Session()
     retry_strategy = Retry(
@@ -219,13 +262,50 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no
         total_ctos = max(1, len(casas_coords) // 2)
 
     logger.info(f"🧠 IA Nível 1: Mapeando {total_ctos} posições brutas para CTOs")
-    kmeans_ctos = KMeans(n_clusters=total_ctos, random_state=42, n_init=20)
-    kmeans_ctos.fit(casas_coords)
-    posicoes_ctos_brutas = kmeans_ctos.cluster_centers_
+    
+    # 1. BUSCA INTELIGENTE PELO KML EDITADO (Aceita arquivos com "Editado" ou "Corrigido" no nome)
+    arquivos_editados = list(INPUT_DIR.glob("*Editad*.kml")) + list(INPUT_DIR.glob("*Corrig*.kml"))
+    
+    posicoes_ctos_brutas = []
+
+    # 2. SE O USUÁRIO FORNECEU UM KML EDITADO, O MODO CORREÇÃO ENTRA EM AÇÃO!
+    if arquivos_editados:
+        caminho_kml_editado = arquivos_editados[0]
+        elementos_editados = ler_kml_corrigido_pelo_usuario(caminho_kml_editado, logger)
+        
+        logger.info(f"📍 MODO DE CORREÇÃO ATIVO: Lendo arquivo '{caminho_kml_editado.name}'...")
+        for elemento in elementos_editados:
+            nome_upper = elemento['nome'].upper()
+            
+            # Filtro inteligente: Pega apenas o que for CTO (gerada automaticamente com "SS" ou manualmente com "CTO")
+            # Ignora CEOs para que a IA possa recalcular a posição da CEO baseada nas novas CTOs
+            if "CTO" in nome_upper or "SS" in nome_upper:
+                posicoes_ctos_brutas.append([elemento['lon'], elemento['lat']])
+                
+        posicoes_ctos_brutas = np.array(posicoes_ctos_brutas)
+        
+        # Atualiza a quantidade real de caixas com base no que o usuário deixou no arquivo
+        if len(posicoes_ctos_brutas) > 0:
+             total_ctos = len(posicoes_ctos_brutas)
+             logger.info(f"✅ Sucesso! {total_ctos} CTOs corrigidas foram extraídas.")
+             logger.info("🔄 A IA vai refazer nomenclatura, colorir PONs e traçar os cabos a partir de agora...")
+    
+    # 3. SE NÃO TEM KML EDITADO, A IA GERA DO ZERO (Comportamento Original)
+    if len(posicoes_ctos_brutas) == 0:
+        logger.info("📍 Modo de Criação Original: Rodando IA para alocação...")
+        kmeans_ctos = KMeans(n_clusters=total_ctos, random_state=42, n_init=20)
+        kmeans_ctos.fit(casas_coords)
+        posicoes_ctos_brutas = kmeans_ctos.cluster_centers_
 
     ctos_por_pon = CONFIG['engenharia'].get('ctos_por_pon', 8)
     pons_por_ceo = CONFIG['engenharia'].get('pons_por_ceo', 2)
     total_ceos = math.ceil(total_pons / pons_por_ceo)
+
+    # REGRAS VISUAIS E DE NOMENCLATURA
+    opcoes_visuais = CONFIG.get('opcoes_visuais_e_nomes', {})
+    nomear_auto = opcoes_visuais.get('nomear_cto_ceo_automaticamente', True)
+    colorir_cto = opcoes_visuais.get('colorir_cto_por_pon', True)
+    colorir_cabos = opcoes_visuais.get('colorir_cabos_por_pon', True)
 
     logger.info(f"🧠 IA Nível 2: Mapeando {total_ceos} Zonas de Cobertura de CEOs")
     if total_ceos > 1:
@@ -287,7 +367,12 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no
         pon_final = pon_inicial + pons_nesta_ceo - 1
         
         tag_sp = f"SP{pon_inicial}-{pon_final}" if pon_inicial != pon_final else f"SP{pon_inicial}"
-        nome_ceo = f"{(ceo_idx + 1):02d}_{no_olt}_{tag_sp}"
+        # Aplica a regra de nomenclatura para a CEO
+        if nomear_auto:
+            nome_ceo = f"{(ceo_idx + 1):02d}_{no_olt}_{tag_sp}"
+        else:
+            nome_ceo = "CEO"
+            
         lista_ceos.append({"nome": nome_ceo, "coords": coord_ceo, "icone": ICONE_CEO})
 
         # ==========================================================
@@ -338,11 +423,20 @@ def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no
                         
             # Se a PON encheu ou acabaram as caixas, exporta e numera
             if len(ctos_nesta_pon) == ctos_por_pon or not ctos_pendentes:
-                icone_pon, cor_cabo_pon = obter_paleta_pon(pon_atual)
+                icone_pon_temp, cor_cabo_pon_temp = obter_paleta_pon(pon_atual)
+                
+                # Aplica as regras de coloração
+                icone_pon = icone_pon_temp if colorir_cto else "http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png"
+                cor_cabo_pon = cor_cabo_pon_temp if colorir_cabos else "ffffff00" # Amarelo padrão
                 
                 for idx_local, (cx, cy) in enumerate(ctos_nesta_pon):
                     lon_cto, lat_cto = alinhar_ponto_na_rua(Point(cx, cy), malha_viaria)
-                    nome_cto = f"{cto_global_counter:03d}_{no_olt}_SP{pon_atual}_SS{idx_local + 1}"
+                    
+                    # Aplica a regra de nomenclatura para a CTO
+                    if nomear_auto:
+                        nome_cto = f"{cto_global_counter:03d}_{no_olt}_SP{pon_atual}_SS{idx_local + 1}"
+                    else:
+                        nome_cto = "CTO"
                     
                     lista_ctos.append({"nome": nome_cto, "coords": (lon_cto, lat_cto), "icone": icone_pon})
                     ctos_metadata.append({"nome": nome_cto, "pon": pon_atual, "lon": lon_cto, "lat": lat_cto})

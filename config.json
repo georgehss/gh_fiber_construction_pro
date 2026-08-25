@@ -5,10 +5,15 @@
         "capacidade_splitter_cto": 8,
         "ctos_por_pon": 8,
         "pons_por_ceo": 2,
-        "distancia_maxima_snap_metros": 50
+        "distancia_maxima_snap_metros": 50 
     },
     "equipamentos": {
         "nome_olt_padrao": "N70"
+    },
+    "opcoes_visuais_e_nomes": {
+        "nomear_cto_ceo_automaticamente": false,
+        "colorir_cto_por_pon": true,
+        "colorir_cabos_por_pon": true
     },
     "api": {
         "overpass_timeout_segundos": 60,
@@ -20,4 +25,3 @@
         "expirar_dias": 30
     }
 }
-
