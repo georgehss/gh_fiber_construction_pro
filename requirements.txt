@@ -4,6 +4,9 @@ requests>=2.28.0
 # Geometry
 shapely>=2.0.0
 
+# Grafos e Roteamento
+networkx>=3.0.0
+
 # IA para edificações
 overturemaps>=0.1.0
 
