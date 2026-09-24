@@ -1,14 +1,39 @@
 import xml.etree.ElementTree as ET
 import math, json, os, requests, itertools
-from shapely.geometry import Polygon, Point, MultiLineString, LineString
+from shapely.geometry import Point, MultiLineString, LineString
 from shapely.ops import nearest_points
-from sklearn.cluster import KMeans
 import numpy as np
 from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from config_validator import ConfigValidator
-from logger_config import configurar_logger
+from .cache_manager import carregar_cache_casas
+from .config import carregar_config
+from .clusterizacao import (
+    ClusterizacaoError,
+    agrupar_pontos_por_capacidade,
+    atribuir_pontos_a_centros_capacitado,
+    clusterizar_pontos_capacitado,
+    validar_alocacao_hierarquica,
+)
+from .dimensionamento import calcular_dimensionamento_ftth, recalcular_hierarquia_por_ctos
+from .geo_io import (
+    bbox_total,
+    extrair_poligonos,
+    extrair_pontos,
+    resolver_arquivo_correcoes,
+    resolver_arquivo_projeto,
+)
+from .logger_config import configurar_logger
+from .roteamento import (
+    ROTA_FORA_DA_MALHA,
+    ROTA_OK,
+    ROTA_SEM_CAMINHO,
+    ROTA_SEM_MALHA,
+    RoteadorViario,
+    calcular_distancia_metros as _calcular_distancia_metros,
+    calcular_metragem_coordenadas,
+    expandir_bbox_com_pontos,
+)
 import networkx as nx
 
 # Identifica a pasta raiz do projeto de forma dinâmica
@@ -16,168 +41,180 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 INPUT_DIR = BASE_DIR / "data" / "input"
 OUTPUT_DIR = BASE_DIR / "data" / "output"
-CONFIG_FILE = BASE_DIR / "config.json"
-
 KML_NS = 'http://www.opengis.net/kml/2.2'
 ET.register_namespace('', KML_NS)
 
-def carregar_casas_cache(nome_projeto, logger):
-    CACHE_CASAS = OUTPUT_DIR / f"{nome_projeto}_casas_cache.json"
-    if not os.path.exists(CACHE_CASAS):
-        raise FileNotFoundError(f"❌ Cache '{CACHE_CASAS}' não encontrado! Rode primeiro o script 'contagem_hp_ai.py'.")
-    with open(CACHE_CASAS, 'r', encoding='utf-8') as f:
-        pontos = json.load(f)
-    return np.array(pontos)
+COR_CABO_PADRAO_KML = "ff00ffff"  # Amarelo em AABBGGRR
+
+
+def carregar_casas_cache(nome_projeto, caminho_projeto, logger, CONFIG):
+    poligonos = extrair_poligonos(Path(caminho_projeto))
+    cache = carregar_cache_casas(OUTPUT_DIR, nome_projeto, poligonos, CONFIG, logger=logger)
+    if cache is None:
+        raise FileNotFoundError(
+            "❌ Cache de edificações ausente, expirado ou incompatível com a geometria atual. "
+            "Rode primeiro 'python -m src.contagem_hp'."
+        )
+    pontos, _ = cache
+    return np.array(pontos), poligonos
 
 def extrair_bbox_poligono(caminho_kml):
-    tree = ET.parse(caminho_kml)
-    root = tree.getroot()
-    ns = {'kml': KML_NS}
-    placemark = root.find('.//kml:Placemark', ns)
-    coords_elem = placemark.find('.//kml:coordinates', ns)
-    raw_coords = coords_elem.text.strip().split()
-    lista_lon_lat = []
-    for pt in raw_coords:
-        partes = pt.split(',')
-        if len(partes) >= 2:
-            lista_lon_lat.append((float(partes[0]), float(partes[1])))
-    poly = Polygon(lista_lon_lat)
-    return poly.bounds
+    """Compatibilidade: retorna o bbox combinado de todos os polígonos KML/KMZ."""
+    return bbox_total(extrair_poligonos(Path(caminho_kml)))
 
 def ler_kml_corrigido_pelo_usuario(caminho_arquivo_kml, logger):
-    """
-    Lê o arquivo KML editado no Google Earth e extrai as novas coordenadas das CTOs/CEOs.
-    Retorna uma lista de dicionários com nome, latitude e longitude.
-    """
-    logger.info(f"🔍 Procurando KML editado em: {caminho_arquivo_kml}")
-    if not os.path.exists(caminho_arquivo_kml):
-         logger.info("ℹ️ Nenhum KML editado encontrado. O script usará as posições brutas do algoritmo.")
-         return []
-
+    """Lê pontos CTO/CEO de um KML ou KMZ de correções."""
+    caminho = Path(caminho_arquivo_kml)
+    logger.info("🔍 Lendo arquivo de correções: %s", caminho.name)
     try:
-        tree = ET.parse(caminho_arquivo_kml)
-        root = tree.getroot()
-        ns = {'kml': KML_NS}
-        
-        elementos_corrigidos = []
-        
-        for placemark in root.findall('.//kml:Placemark', ns):
-            nome_tag = placemark.find('kml:name', ns)
-            ponto_tag = placemark.find('.//kml:Point/kml:coordinates', ns)
-            
-            if nome_tag is not None and ponto_tag is not None:
-                nome = nome_tag.text.strip()
-                coords_str = ponto_tag.text.strip()
-                coords_list = coords_str.split(',')
-                
-                if len(coords_list) >= 2:
-                    lon = float(coords_list[0])
-                    lat = float(coords_list[1])
-                    
-                    elementos_corrigidos.append({
-                        "nome": nome,
-                        "lat": lat,
-                        "lon": lon
-                    })
-                    
-        logger.info(f"✅ Sucesso! {len(elementos_corrigidos)} elementos carregados do KML corrigido.")
-        return elementos_corrigidos
-
-    except Exception as e:
-        logger.warning(f"⚠️ Erro ao ler o KML corrigido: {e}. O sistema ignorará o arquivo.")
+        elementos = extrair_pontos(caminho)
+        logger.info("✅ %d elementos carregados do arquivo de correções.", len(elementos))
+        return elementos
+    except (OSError, ValueError) as exc:
+        logger.warning("⚠️ Erro ao ler correções: %s. O arquivo será ignorado.", exc)
         return []
 
-def criar_sessao_com_retry():
+def criar_sessao_com_retry(CONFIG):
+    """Cria sessão HTTP usando a política de retry definida no config."""
+
+    api_config = CONFIG["api"]
     sessao = requests.Session()
     retry_strategy = Retry(
-        total=3, 
-        backoff_factor=1, 
+        total=api_config["overpass_retry_max"],
+        backoff_factor=api_config["overpass_backoff_factor"],
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "POST"] 
+        allowed_methods=["HEAD", "GET", "POST"],
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     sessao.mount("http://", adapter)
     sessao.mount("https://", adapter)
     return sessao
 
-def baixar_linhas_ruas(bbox, logger, CONFIG):
-    logger.info("🛣️ Obtendo malha viária...")
+
+def montar_consulta_overpass(bbox, timeout_segundos):
+    """Monta a consulta Overpass usando o timeout configurado."""
+
     min_lon, min_lat, max_lon, max_lat = bbox
-    overpass_query = f"""
-[out:json][timeout:60];
+    return f"""
+[out:json][timeout:{timeout_segundos}];
 (way["highway"]({min_lat},{min_lon},{max_lat},{max_lon});
  way["junction"]({min_lat},{min_lon},{max_lat},{max_lon}););
 out geom;
 """
+
+
+def baixar_linhas_ruas(bbox, logger, CONFIG):
+    logger.info("🛣️ Obtendo malha viária...")
+    api_config = CONFIG["api"]
+    timeout = api_config["overpass_timeout_segundos"]
+    overpass_query = montar_consulta_overpass(bbox, timeout)
     url = "https://overpass-api.de/api/interpreter"
-    timeout = CONFIG['api'].get('overpass_timeout_segundos', 60)
-    headers = {'User-Agent': 'FTTH_Snapper/2.0', 'Accept': 'application/json'}
+    headers = {"User-Agent": "FTTH_Snapper/2.1", "Accept": "application/json"}
     linhas_ruas = []
     try:
-        sessao = criar_sessao_com_retry()
-        res = sessao.post(url, data={'data': overpass_query}, headers=headers, timeout=timeout + 5)
+        sessao = criar_sessao_com_retry(CONFIG)
+        res = sessao.post(
+            url,
+            data={"data": overpass_query},
+            headers=headers,
+            timeout=timeout,
+        )
         res.raise_for_status()
         data = res.json()
-        for elem in data.get('elements', []):
-            geom = elem.get('geometry', [])
+        for elem in data.get("elements", []):
+            geom = elem.get("geometry", [])
             if len(geom) >= 2:
-                coords = [(pt['lon'], pt['lat']) for pt in geom]
+                coords = [(pt["lon"], pt["lat"]) for pt in geom]
                 linhas_ruas.append(LineString(coords))
         return MultiLineString(linhas_ruas) if linhas_ruas else None
     except requests.exceptions.RequestException as e:
         logger.warning(f"⚠️ Erro ao obter vias: {e}")
         return None
 
-def alinhar_ponto_na_rua(ponto, malha_viaria):
+
+def alinhar_ponto_na_rua(
+    ponto,
+    malha_viaria,
+    distancia_maxima_metros=None,
+    logger=None,
+    rotulo="ponto",
+):
+    """Alinha um ponto à via somente quando o snap respeita o limite.
+
+    Se não houver malha viária ou se a via mais próxima estiver além de
+    ``distancia_maxima_metros``, a coordenada original é preservada.
+    """
+
     if malha_viaria is None:
         return ponto.x, ponto.y
+
     pt_proximo = nearest_points(malha_viaria, ponto)[0]
+    distancia_snap = calcular_distancia_metros(
+        ponto.x, ponto.y, pt_proximo.x, pt_proximo.y
+    )
+
+    if (
+        distancia_maxima_metros is not None
+        and distancia_snap > distancia_maxima_metros
+    ):
+        if logger is not None:
+            logger.warning(
+                "⚠️ Snap ignorado para %s: via mais próxima a %.1fm "
+                "(limite %.1fm).",
+                rotulo,
+                distancia_snap,
+                distancia_maxima_metros,
+            )
+        return ponto.x, ponto.y
+
     return pt_proximo.x, pt_proximo.y
 
 def construir_grafo_ruas(malha_viaria):
-    G = nx.Graph()
-    if malha_viaria is None:
-        return G
-    linhas = malha_viaria.geoms if hasattr(malha_viaria, 'geoms') else [malha_viaria]
-    for linha in linhas:
-        coords = list(linha.coords)
-        for i in range(len(coords) - 1):
-            p1, p2 = coords[i], coords[i+1]
-            dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-            G.add_edge(p1, p2, weight=dist)
-    return G
+    """Compatibilidade: constrói o roteador viário indexado da Fase 6."""
 
-def calcular_rota_pela_rua(G, pt_origem, pt_destino):
-    if len(G.nodes) == 0:
-        return [pt_origem, pt_destino] 
-    nodes = list(G.nodes)
-    no_origem = min(nodes, key=lambda n: math.hypot(n[0]-pt_origem[0], n[1]-pt_origem[1]))
-    no_destino = min(nodes, key=lambda n: math.hypot(n[0]-pt_destino[0], n[1]-pt_destino[1]))
-    try:
-        caminho = nx.shortest_path(G, source=no_origem, target=no_destino, weight='weight')
-        rota_completa = [pt_origem] + caminho + [pt_destino]
-        rota_limpa = []
-        for p in rota_completa:
-            if not rota_limpa or p != rota_limpa[-1]:
-                rota_limpa.append(p)
-        return rota_limpa
-    except nx.NetworkXNoPath:
-        return [pt_origem, pt_destino]
+    return RoteadorViario(malha_viaria)
+
+
+def calcular_rota_detalhada(roteador, pt_origem, pt_destino, distancia_maxima_conexao_m=None):
+    """Retorna ResultadoRota com status explícito, sem fallback silencioso."""
+
+    if not isinstance(roteador, RoteadorViario):
+        raise TypeError("roteador deve ser uma instância de RoteadorViario")
+    return roteador.calcular_rota(
+        pt_origem,
+        pt_destino,
+        distancia_maxima_conexao_m=distancia_maxima_conexao_m,
+    )
+
+
+def calcular_rota_pela_rua(roteador, pt_origem, pt_destino):
+    """Compatibilidade legada: retorna coordenadas somente para rotas válidas."""
+
+    resultado = calcular_rota_detalhada(roteador, pt_origem, pt_destino)
+    return resultado.coordenadas if resultado.valida else []
+
 
 def calcular_distancia_metros(lon1, lat1, lon2, lat2):
-    R = 6371000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-    a = math.sin(delta_phi/2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2.0)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
+    return _calcular_distancia_metros(lon1, lat1, lon2, lat2)
+
 
 def calcular_metragem_rota(rota):
-    distancia = 0
-    for i in range(len(rota) - 1):
-        distancia += calcular_distancia_metros(rota[i][0], rota[i][1], rota[i+1][0], rota[i+1][1])
-    return distancia
+    return calcular_metragem_coordenadas(rota)
+
+
+def obter_olt_fisica(CONFIG):
+    """Retorna metadados da OLT física ou ``None`` quando não configurada."""
+
+    equipamentos = CONFIG["equipamentos"]
+    olt = equipamentos["olt"]
+    if olt["latitude"] is None or olt["longitude"] is None:
+        return None
+    return {
+        "id": "OLT_0001",
+        "nome": equipamentos["nome_olt_padrao"],
+        "coords_brutas": (float(olt["longitude"]), float(olt["latitude"])),
+    }
+
 
 # --- DEFINIÇÃO DA PALETA DE CORES POR PON ---
 def obter_paleta_pon(pon_num):
@@ -192,6 +229,15 @@ def obter_paleta_pon(pon_num):
     ]
     return paletas[(pon_num - 1) % len(paletas)]
 
+
+def obter_cor_cabo_pon(pon_num, colorir_cabos):
+    """Retorna a cor do cabo respeitando a opção visual do projeto."""
+
+    if not colorir_cabos:
+        return COR_CABO_PADRAO_KML
+    _, cor = obter_paleta_pon(pon_num)
+    return cor
+
 # --- FUNÇÕES KML DINÂMICAS ---
 def criar_kml_pontos_dinamico(nome_arquivo, pasta_nome, pontos, logger):
     kml = ET.Element(f'{{{KML_NS}}}kml')
@@ -204,6 +250,10 @@ def criar_kml_pontos_dinamico(nome_arquivo, pasta_nome, pontos, logger):
         pm = ET.SubElement(folder, f'{{{KML_NS}}}Placemark')
         p_name = ET.SubElement(pm, f'{{{KML_NS}}}name')
         p_name.text = item['nome']
+
+        if item.get('descricao'):
+            descricao = ET.SubElement(pm, f'{{{KML_NS}}}description')
+            descricao.text = item['descricao']
         
         if item.get('icone'):
             style = ET.SubElement(pm, f'{{{KML_NS}}}Style')
@@ -232,11 +282,15 @@ def criar_kml_linhas_dinamico(nome_arquivo, pasta_nome, linhas, logger, largura=
         pm = ET.SubElement(folder, f'{{{KML_NS}}}Placemark')
         p_name = ET.SubElement(pm, f'{{{KML_NS}}}name')
         p_name.text = linha['nome']
+
+        if linha.get('descricao'):
+            descricao = ET.SubElement(pm, f'{{{KML_NS}}}description')
+            descricao.text = linha['descricao']
         
         style = ET.SubElement(pm, f'{{{KML_NS}}}Style')
         line_style = ET.SubElement(style, f'{{{KML_NS}}}LineStyle')
         color = ET.SubElement(line_style, f'{{{KML_NS}}}color')
-        color.text = linha.get('cor', 'ff00ffff') # Default amarelo
+        color.text = linha.get('cor', COR_CABO_PADRAO_KML)  # Default amarelo
         width = ET.SubElement(line_style, f'{{{KML_NS}}}width')
         width.text = str(largura)
         
@@ -251,313 +305,898 @@ def criar_kml_linhas_dinamico(nome_arquivo, pasta_nome, linhas, logger, largura=
     tree.write(nome_arquivo, encoding='utf-8', xml_declaration=True)
 
 
-def executar_posicionamento_inteligente(kml_poligono, total_ctos, total_pons, no_olt, nome_projeto, logger, CONFIG):
-    casas_coords = carregar_casas_cache(nome_projeto, logger)
-    bbox = extrair_bbox_poligono(kml_poligono)
-    malha_viaria = baixar_linhas_ruas(bbox, logger, CONFIG)
-    grafo_ruas = construir_grafo_ruas(malha_viaria)
+def _ordenar_ctos_por_rota(
+    ctos,
+    coord_ceo,
+    roteador,
+    distancia_maxima_entre_ctos,
+    distancia_maxima_conexao_m=None,
+):
+    """Ordena CTOs de uma PON sem transformar falha de rota em linha válida."""
 
-    if len(casas_coords) < total_ctos:
-        logger.warning(f"⚠️ Casas ({len(casas_coords)}) < CTOs ({total_ctos})")
-        total_ctos = max(1, len(casas_coords) // 2)
+    pendentes = list(ctos)
+    ordenadas = []
+    if not pendentes:
+        return ordenadas
 
-    logger.info(f"🧠 IA Nível 1: Mapeando {total_ctos} posições brutas para CTOs")
-    
-    # 1. BUSCA INTELIGENTE PELO KML EDITADO (Aceita arquivos com "Editado" ou "Corrigido" no nome)
-    arquivos_editados = list(INPUT_DIR.glob("*Editad*.kml")) + list(INPUT_DIR.glob("*Corrig*.kml"))
-    
-    posicoes_ctos_brutas = []
+    def chave_rota(origem, destino):
+        resultado = calcular_rota_detalhada(
+            roteador, origem, destino, distancia_maxima_conexao_m
+        )
+        if resultado.valida:
+            return (0, resultado.distancia_m)
+        # A distância geodésica serve apenas para uma ordenação determinística
+        # quando não existe rota; o cabo continuará marcado como exceção.
+        return (1, calcular_distancia_metros(*origem, *destino))
 
-    # 2. SE O USUÁRIO FORNECEU UM KML EDITADO, O MODO CORREÇÃO ENTRA EM AÇÃO!
-    if arquivos_editados:
-        caminho_kml_editado = arquivos_editados[0]
-        elementos_editados = ler_kml_corrigido_pelo_usuario(caminho_kml_editado, logger)
-        
-        logger.info(f"📍 MODO DE CORREÇÃO ATIVO: Lendo arquivo '{caminho_kml_editado.name}'...")
-        for elemento in elementos_editados:
-            nome_upper = elemento['nome'].upper()
-            
-            # Filtro inteligente: Pega apenas o que for CTO (gerada automaticamente com "SS" ou manualmente com "CTO")
-            # Ignora CEOs para que a IA possa recalcular a posição da CEO baseada nas novas CTOs
-            if "CTO" in nome_upper or "SS" in nome_upper:
-                posicoes_ctos_brutas.append([elemento['lon'], elemento['lat']])
-                
-        posicoes_ctos_brutas = np.array(posicoes_ctos_brutas)
-        
-        # Atualiza a quantidade real de caixas com base no que o usuário deixou no arquivo
-        if len(posicoes_ctos_brutas) > 0:
-             total_ctos = len(posicoes_ctos_brutas)
-             logger.info(f"✅ Sucesso! {total_ctos} CTOs corrigidas foram extraídas.")
-             logger.info("🔄 A IA vai refazer nomenclatura, colorir PONs e traçar os cabos a partir de agora...")
-    
-    # 3. SE NÃO TEM KML EDITADO, A IA GERA DO ZERO (Comportamento Original)
-    if len(posicoes_ctos_brutas) == 0:
-        logger.info("📍 Modo de Criação Original: Rodando IA para alocação...")
-        kmeans_ctos = KMeans(n_clusters=total_ctos, random_state=42, n_init=20)
-        kmeans_ctos.fit(casas_coords)
-        posicoes_ctos_brutas = kmeans_ctos.cluster_centers_
+    atual = min(
+        pendentes,
+        key=lambda c: chave_rota(coord_ceo, c["coords_brutas"]),
+    )
+    ordenadas.append(atual)
+    pendentes.remove(atual)
 
-    ctos_por_pon = CONFIG['engenharia'].get('ctos_por_pon', 8)
-    pons_por_ceo = CONFIG['engenharia'].get('pons_por_ceo', 2)
-    total_ceos = math.ceil(total_pons / pons_por_ceo)
+    while pendentes:
+        ultima = ordenadas[-1]
+        candidatos = sorted(
+            pendentes,
+            key=lambda cand: chave_rota(ultima["coords_brutas"], cand["coords_brutas"]),
+        )
+        escolhido = candidatos[0]
+        resultado = calcular_rota_detalhada(
+            roteador,
+            ultima["coords_brutas"],
+            escolhido["coords_brutas"],
+            distancia_maxima_conexao_m,
+        )
 
-    # REGRAS VISUAIS E DE NOMENCLATURA
-    opcoes_visuais = CONFIG.get('opcoes_visuais_e_nomes', {})
-    nomear_auto = opcoes_visuais.get('nomear_cto_ceo_automaticamente', True)
-    colorir_cto = opcoes_visuais.get('colorir_cto_por_pon', True)
-    colorir_cabos = opcoes_visuais.get('colorir_cabos_por_pon', True)
+        if (not resultado.valida) or resultado.distancia_m > distancia_maxima_entre_ctos:
+            derivacoes = []
+            for origem in ordenadas:
+                for cand in pendentes:
+                    rota = calcular_rota_detalhada(
+                        roteador,
+                        origem["coords_brutas"],
+                        cand["coords_brutas"],
+                        distancia_maxima_conexao_m,
+                    )
+                    if rota.valida and rota.distancia_m <= distancia_maxima_entre_ctos:
+                        derivacoes.append((rota.distancia_m, cand["id"], cand))
+            if derivacoes:
+                derivacoes.sort(key=lambda item: (item[0], item[1]))
+                escolhido = derivacoes[0][2]
 
-    logger.info(f"🧠 IA Nível 2: Mapeando {total_ceos} Zonas de Cobertura de CEOs")
-    if total_ceos > 1:
-        kmeans_ceos = KMeans(n_clusters=total_ceos, random_state=42, n_init=20)
-        labels_ceos = kmeans_ceos.fit_predict(posicoes_ctos_brutas)
+        ordenadas.append(escolhido)
+        pendentes.remove(escolhido)
+
+    return ordenadas
+
+
+def _ordenar_ceos_geograficamente(ceos):
+    """Ordena CEOs de forma determinística para nomenclatura/apresentação."""
+
+    restantes = list(ceos)
+    if not restantes:
+        return []
+
+    atual = min(
+        restantes,
+        key=lambda z: (z["coords"][0], -z["coords"][1], z["id"]),
+    )
+    ordenadas = [atual]
+    restantes.remove(atual)
+
+    while restantes:
+        proxima = min(
+            restantes,
+            key=lambda z: (
+                math.hypot(
+                    z["coords"][0] - atual["coords"][0],
+                    z["coords"][1] - atual["coords"][1],
+                ),
+                z["id"],
+            ),
+        )
+        ordenadas.append(proxima)
+        restantes.remove(proxima)
+        atual = proxima
+
+    return ordenadas
+
+
+def _criar_modelo_capacitado(
+    casas_coords,
+    posicoes_ctos_manuais,
+    total_ctos_planejado,
+    logger,
+    CONFIG,
+):
+    """Cria HP -> CTO -> PON -> CEO respeitando limites rígidos."""
+
+    engenharia = CONFIG["engenharia"]
+    capacidade_hp = engenharia["capacidade_hp_por_cto"]
+    ctos_por_pon = engenharia["ctos_por_pon"]
+    pons_por_ceo = engenharia["pons_por_ceo"]
+
+    n_hp = len(casas_coords)
+    if n_hp == 0:
+        raise ClusterizacaoError("não existem HP para posicionamento")
+
+    ctos = []
+    if posicoes_ctos_manuais is not None and len(posicoes_ctos_manuais) > 0:
+        centros = np.asarray(posicoes_ctos_manuais, dtype=float)
+        if len(centros) * capacidade_hp < n_hp:
+            raise ClusterizacaoError(
+                f"correção manual insuficiente: {len(centros)} CTOs cobrem no máximo "
+                f"{len(centros) * capacidade_hp} HP, mas o projeto possui {n_hp} HP"
+            )
+        if len(centros) < total_ctos_planejado:
+            logger.warning(
+                "⚠️ O arquivo manual possui %d CTOs, abaixo das %d planejadas (incluindo reserva).",
+                len(centros),
+                total_ctos_planejado,
+            )
+        labels_cto = atribuir_pontos_a_centros_capacitado(
+            casas_coords, centros, capacidade_hp
+        )
+        logger.info(
+            "🧭 %d CTOs manuais mantidas; HPs redistribuídos com limite de %d HP/CTO.",
+            len(centros),
+            capacidade_hp,
+        )
+        for idx, centro in enumerate(centros):
+            indices = np.where(labels_cto == idx)[0]
+            ctos.append(
+                {
+                    "id": f"CTO_{idx + 1:04d}",
+                    "coords_brutas": (float(centro[0]), float(centro[1])),
+                    "hp_indices": [int(i) for i in indices],
+                }
+            )
     else:
-        labels_ceos = np.zeros(total_ctos, dtype=int)
+        labels_cto, clusters_cto = clusterizar_pontos_capacitado(
+            casas_coords,
+            total_ctos_planejado,
+            capacidade_hp,
+        )
+        for idx, cluster in enumerate(clusters_cto):
+            ctos.append(
+                {
+                    "id": f"CTO_{idx + 1:04d}",
+                    "coords_brutas": tuple(cluster["centro"]),
+                    "hp_indices": list(cluster["indices"]),
+                }
+            )
+        logger.info(
+            "✅ Clusterização capacitada HP→CTO: máximo observado %d/%d HP por CTO.",
+            max(len(c["hp_indices"]) for c in ctos),
+            capacidade_hp,
+        )
 
-    # ==========================================================
-    # PRÉ-PROCESSAMENTO: ORDENAÇÃO GEOGRÁFICA DAS ZONAS DE CEO
-    # ==========================================================
-    zonas_ceos_brutas = []
-    for ceo_idx in range(total_ceos):
-        ctos_desta_zona = posicoes_ctos_brutas[labels_ceos == ceo_idx]
-        if len(ctos_desta_zona) == 0: 
-            continue
-            
-        media_lon = sum(c[0] for c in ctos_desta_zona) / len(ctos_desta_zona)
-        media_lat = sum(c[1] for c in ctos_desta_zona) / len(ctos_desta_zona)
-        lon_ceo, lat_ceo = alinhar_ponto_na_rua(Point(media_lon, media_lat), malha_viaria)
-        
-        zonas_ceos_brutas.append({
-            "coords": (lon_ceo, lat_ceo),
-            "ctos_brutas": ctos_desta_zona
-        })
-        
-    zonas_ordenadas = []
-    if len(zonas_ceos_brutas) > 0:
-        # Pega a zona mais a Noroeste como ponto de partida
-        atual = min(zonas_ceos_brutas, key=lambda z: (z['coords'][0], -z['coords'][1]))
-        zonas_ordenadas.append(atual)
-        zonas_ceos_brutas.remove(atual)
-        
-        # Conecta geograficamente a CEO mais próxima na sequência
-        while zonas_ceos_brutas:
-            mais_proximo = min(zonas_ceos_brutas, key=lambda z: math.hypot(z['coords'][0]-atual['coords'][0], z['coords'][1]-atual['coords'][1]))
-            zonas_ordenadas.append(mais_proximo)
-            zonas_ceos_brutas.remove(mais_proximo)
-            atual = mais_proximo
+    # CTO -> PON: a quantidade de PONs é a mínima compatível com a capacidade.
+    coords_ctos = [c["coords_brutas"] for c in ctos]
+    labels_pon, clusters_pon = agrupar_pontos_por_capacidade(coords_ctos, ctos_por_pon)
+    pons = []
+    for idx, cluster in enumerate(clusters_pon):
+        cto_indices = list(cluster["indices"])
+        pon_id = f"PON_{idx + 1:04d}"
+        cto_ids = [ctos[i]["id"] for i in cto_indices]
+        pons.append(
+            {
+                "id": pon_id,
+                "coords_brutas": tuple(cluster["centro"]),
+                "cto_ids": cto_ids,
+            }
+        )
+        for cto_idx in cto_indices:
+            ctos[cto_idx]["pon_id"] = pon_id
+
+    # PON -> CEO: a CEO passa a respeitar rigidamente pons_por_ceo.
+    coords_pons = [p["coords_brutas"] for p in pons]
+    labels_ceo, clusters_ceo = agrupar_pontos_por_capacidade(coords_pons, pons_por_ceo)
+    ceos = []
+    for idx, cluster in enumerate(clusters_ceo):
+        pon_indices = list(cluster["indices"])
+        ceo_id = f"CEO_{idx + 1:04d}"
+        pon_ids = [pons[i]["id"] for i in pon_indices]
+        ceos.append(
+            {
+                "id": ceo_id,
+                "coords_brutas": tuple(cluster["centro"]),
+                "pon_ids": pon_ids,
+            }
+        )
+        for pon_idx in pon_indices:
+            pons[pon_idx]["ceo_id"] = ceo_id
+
+    validacao = validar_alocacao_hierarquica(
+        quantidade_hps=n_hp,
+        ctos=ctos,
+        pons=pons,
+        ceos=ceos,
+        capacidade_hp_por_cto=capacidade_hp,
+        ctos_por_pon=ctos_por_pon,
+        pons_por_ceo=pons_por_ceo,
+    )
+
+    return ctos, pons, ceos, validacao
+
+
+def executar_posicionamento_inteligente(
+    kml_poligono,
+    total_ctos,
+    total_pons,
+    no_olt,
+    nome_projeto,
+    logger,
+    CONFIG,
+):
+    casas_coords, poligonos = carregar_casas_cache(
+        nome_projeto, kml_poligono, logger, CONFIG
+    )
+    bbox = bbox_total(poligonos)
+    olt_fisica = obter_olt_fisica(CONFIG)
+
+    engenharia = CONFIG["engenharia"]
+    pontos_bbox = [olt_fisica["coords_brutas"]] if olt_fisica is not None else []
+    bbox_roteamento = expandir_bbox_com_pontos(
+        bbox,
+        pontos_bbox,
+        margem_metros=engenharia["margem_bbox_roteamento_metros"],
+    )
+    malha_viaria = baixar_linhas_ruas(bbox_roteamento, logger, CONFIG)
+    grafo_ruas = construir_grafo_ruas(malha_viaria)
+    if len(grafo_ruas) == 0:
+        logger.warning(
+            "⚠️ Malha viária indisponível. Cabos não serão convertidos em linhas retas; "
+            "as ligações serão registradas como exceções de roteamento."
+        )
+
+    capacidade_hp = engenharia["capacidade_hp_por_cto"]
+    splitter_inicial = engenharia["splitter_cto_inicial"]
+    splitter_expansao = engenharia["splitter_cto_expansao"]
+    ctos_por_pon = engenharia["ctos_por_pon"]
+    pons_por_ceo = engenharia["pons_por_ceo"]
+    distancia_maxima_snap = engenharia["distancia_maxima_snap_metros"]
+    distancia_maxima_entre_ctos = engenharia["distancia_maxima_entre_ctos_metros"]
+    penetracao = engenharia["penetracao_estimada"]
+
+    # Não confia cegamente em JSON de fases anteriores: recalcula o plano com
+    # a regra atual de 16 HP/CTO e a reserva configurada.
+    dimensionamento_atual = calcular_dimensionamento_ftth(len(casas_coords), CONFIG)
+    total_ctos_calculado = dimensionamento_atual["ctos"]
+    if total_ctos != total_ctos_calculado:
+        logger.warning(
+            "⚠️ CTOs do JSON recalculadas pela regra atual: %d → %d.",
+            total_ctos,
+            total_ctos_calculado,
+        )
+    total_ctos = total_ctos_calculado
+
+    logger.info(
+        "🧠 Fase 6: topologia física sobre clusterização capacitada (%d HP/CTO, splitter 1x%d → 1x%d).",
+        capacidade_hp,
+        splitter_inicial,
+        splitter_expansao,
+    )
+
+    caminho_kml_editado = resolver_arquivo_correcoes(INPUT_DIR, CONFIG)
+    posicoes_ctos_manuais = None
+    if caminho_kml_editado is not None:
+        elementos_editados = ler_kml_corrigido_pelo_usuario(caminho_kml_editado, logger)
+        coords = []
+        for elemento in elementos_editados:
+            nome_upper = elemento["nome"].upper()
+            if "CTO" in nome_upper or "SS" in nome_upper:
+                coords.append([elemento["lon"], elemento["lat"]])
+        if coords:
+            posicoes_ctos_manuais = np.asarray(coords, dtype=float)
+            logger.info(
+                "📍 Modo de correção: %d posições de CTO serão preservadas.",
+                len(posicoes_ctos_manuais),
+            )
+
+    ctos, pons, ceos, validacao = _criar_modelo_capacitado(
+        casas_coords,
+        posicoes_ctos_manuais,
+        total_ctos,
+        logger,
+        CONFIG,
+    )
+
+    total_ctos = len(ctos)
+    hierarquia_real = recalcular_hierarquia_por_ctos(total_ctos, CONFIG)
+    if total_pons != hierarquia_real["pons"]:
+        logger.warning(
+            "⚠️ Quantidade de PONs recalculada: %d → %d.",
+            total_pons,
+            hierarquia_real["pons"],
+        )
+
+    if len(pons) != hierarquia_real["pons"] or len(ceos) != hierarquia_real["ceos"]:
+        raise ClusterizacaoError(
+            "a hierarquia capacitada não corresponde ao dimensionamento mínimo esperado"
+        )
+
+    logger.info(
+        "✅ Hierarquia validada: %d HP → %d CTOs → %d PONs → %d CEOs.",
+        len(casas_coords),
+        len(ctos),
+        len(pons),
+        len(ceos),
+    )
+
+    opcoes_visuais = CONFIG["opcoes_visuais_e_nomes"]
+    nomear_auto = opcoes_visuais["nomear_cto_ceo_automaticamente"]
+    colorir_cto = opcoes_visuais["colorir_cto_por_pon"]
+    colorir_cabos = opcoes_visuais["colorir_cabos_por_pon"]
+
+    # Posiciona CEOs a partir das PONs que realmente pertencem a cada uma.
+    for ceo in ceos:
+        lon_ceo, lat_ceo = alinhar_ponto_na_rua(
+            Point(*ceo["coords_brutas"]),
+            malha_viaria,
+            distancia_maxima_metros=distancia_maxima_snap,
+            logger=logger,
+            rotulo=ceo["id"],
+        )
+        ceo["coords"] = (lon_ceo, lat_ceo)
+
+    lista_olts = []
+    if olt_fisica is not None:
+        lon_olt, lat_olt = alinhar_ponto_na_rua(
+            Point(*olt_fisica["coords_brutas"]),
+            malha_viaria,
+            distancia_maxima_metros=distancia_maxima_snap,
+            logger=logger,
+            rotulo=olt_fisica["id"],
+        )
+        olt_fisica["coords"] = (lon_olt, lat_olt)
+        olt_fisica["referencia"] = olt_fisica["nome"]
+        lista_olts.append(
+            {
+                "id": olt_fisica["id"],
+                "nome": olt_fisica["nome"],
+                "coords": olt_fisica["coords"],
+                "icone": "http://maps.google.com/mapfiles/kml/shapes/target.png",
+                "descricao": (
+                    f"ID interno: {olt_fisica['id']}\n"
+                    f"Coordenada configurada: {olt_fisica['coords_brutas'][1]:.7f}, "
+                    f"{olt_fisica['coords_brutas'][0]:.7f}"
+                ),
+            }
+        )
+        logger.info(
+            "🏢 OLT física configurada: %s (%.7f, %.7f).",
+            olt_fisica["nome"],
+            olt_fisica["coords"][1],
+            olt_fisica["coords"][0],
+        )
+    else:
+        logger.warning(
+            "⚠️ Coordenadas da OLT não configuradas. O backbone será gerado apenas entre CEOs."
+        )
+
+    ceos_ordenadas = _ordenar_ceos_geograficamente(ceos)
+    pons_por_id = {p["id"]: p for p in pons}
+    ctos_por_id = {c["id"]: c for c in ctos}
 
     lista_ctos = []
     lista_ceos = []
     lista_cabos_dist = []
     lista_cabos_backbone = []
-    
+    lista_excecoes_roteamento = []
     pon_global_counter = 1
     cto_global_counter = 1
     ICONE_CEO = "http://maps.google.com/mapfiles/kml/pushpin/red-pushpin.png"
 
-    # ==========================================================
-    # PROCESSAMENTO POR ZONA DE COBERTURA ORDENADA
-    # ==========================================================
-    for ceo_idx, zona in enumerate(zonas_ordenadas):
-        ctos_desta_zona = zona['ctos_brutas']
-        coord_ceo = zona['coords']
-        
-        pons_nesta_ceo = math.ceil(len(ctos_desta_zona) / ctos_por_pon)
+    for ceo_ordem, ceo in enumerate(ceos_ordenadas, start=1):
+        pons_ceo = [pons_por_id[pid] for pid in ceo["pon_ids"]]
+        pons_ceo.sort(
+            key=lambda p: (
+                math.hypot(
+                    p["coords_brutas"][0] - ceo["coords_brutas"][0],
+                    p["coords_brutas"][1] - ceo["coords_brutas"][1],
+                ),
+                p["id"],
+            )
+        )
+
         pon_inicial = pon_global_counter
-        pon_final = pon_inicial + pons_nesta_ceo - 1
-        
-        tag_sp = f"SP{pon_inicial}-{pon_final}" if pon_inicial != pon_final else f"SP{pon_inicial}"
-        # Aplica a regra de nomenclatura para a CEO
-        if nomear_auto:
-            nome_ceo = f"{(ceo_idx + 1):02d}_{no_olt}_{tag_sp}"
-        else:
-            nome_ceo = "CEO"
-            
-        lista_ceos.append({"nome": nome_ceo, "coords": coord_ceo, "icone": ICONE_CEO})
+        pon_final = pon_inicial + len(pons_ceo) - 1
+        tag_sp = (
+            f"SP{pon_inicial}-{pon_final}"
+            if pon_inicial != pon_final
+            else f"SP{pon_inicial}"
+        )
+        nome_ceo = f"{ceo_ordem:02d}_{no_olt}_{tag_sp}" if nomear_auto else "CEO"
+        ceo["nome"] = nome_ceo
+        ceo["ordem"] = ceo_ordem
+        ceo["referencia"] = nome_ceo if nomear_auto else ceo["id"]
+        lista_ceos.append(
+            {
+                "id": ceo["id"],
+                "nome": nome_ceo,
+                "coords": ceo["coords"],
+                "icone": ICONE_CEO,
+                "descricao": (
+                    f"ID interno: {ceo['id']}\n"
+                    f"PONs: {len(pons_ceo)}/{pons_por_ceo}"
+                ),
+            }
+        )
 
-        # ==========================================================
-        # CONSTRUTOR DE PON BASEADO NAS RUAS (A Mágica da Sequência)
-        # ==========================================================
-        ctos_pendentes = [tuple(p) for p in ctos_desta_zona]
-        pon_atual = pon_inicial
-        ctos_nesta_pon = []
-        ctos_metadata = []
+        ctos_metadata_ceo = []
+        for pon in pons_ceo:
+            pon_numero = pon_global_counter
+            pon["numero"] = pon_numero
+            ctos_pon = [ctos_por_id[cid] for cid in pon["cto_ids"]]
+            ctos_ordenadas = _ordenar_ctos_por_rota(
+                ctos_pon,
+                ceo["coords"],
+                grafo_ruas,
+                distancia_maxima_entre_ctos,
+                distancia_maxima_snap,
+            )
+            pon["cto_ids"] = [c["id"] for c in ctos_ordenadas]
 
-        while ctos_pendentes:
-            if not ctos_nesta_pon:
-                # 1. A CTO 01 da PON sempre será a fisicamente mais próxima da CEO pelas ruas
-                atual = min(ctos_pendentes, key=lambda p: calcular_metragem_rota(calcular_rota_pela_rua(grafo_ruas, coord_ceo, p)))
-                ctos_nesta_pon.append(atual)
-                ctos_pendentes.remove(atual)
-            else:
-                ultima_cto = ctos_nesta_pon[-1]
-                melhor_cand, menor_dist = None, float('inf')
-                
-                # 2. Busca a próxima CTO seguindo a rua (Daisy-Chain)
-                for cand in ctos_pendentes:
-                    rota = calcular_rota_pela_rua(grafo_ruas, ultima_cto, cand)
-                    dist = calcular_metragem_rota(rota)
-                    if dist < menor_dist:
-                        menor_dist = dist; melhor_cand = cand
-                
-                if menor_dist <= 150:
-                    ctos_nesta_pon.append(melhor_cand)
-                    ctos_pendentes.remove(melhor_cand)
-                else:
-                    # 3. Derivação de emergência durante a criação do agrupamento
-                    melhor_cand_deriv, menor_dist_deriv = None, float('inf')
-                    for c_in_pon in ctos_nesta_pon:
-                        for cand in ctos_pendentes:
-                            rota = calcular_rota_pela_rua(grafo_ruas, c_in_pon, cand)
-                            dist = calcular_metragem_rota(rota)
-                            if dist < menor_dist_deriv:
-                                menor_dist_deriv = dist; melhor_cand_deriv = cand
-                    
-                    if menor_dist_deriv <= 150:
-                        ctos_nesta_pon.append(melhor_cand_deriv)
-                        ctos_pendentes.remove(melhor_cand_deriv)
-                    else:
-                        # 4. Falha de Isolamento: Força a adição para que a regra de CEO crie um Feed_Extra depois
-                        ctos_nesta_pon.append(melhor_cand)
-                        ctos_pendentes.remove(melhor_cand)
-                        
-            # Se a PON encheu ou acabaram as caixas, exporta e numera
-            if len(ctos_nesta_pon) == ctos_por_pon or not ctos_pendentes:
-                icone_pon_temp, cor_cabo_pon_temp = obter_paleta_pon(pon_atual)
-                
-                # Aplica as regras de coloração
-                icone_pon = icone_pon_temp if colorir_cto else "http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png"
-                cor_cabo_pon = cor_cabo_pon_temp if colorir_cabos else "ffffff00" # Amarelo padrão
-                
-                for idx_local, (cx, cy) in enumerate(ctos_nesta_pon):
-                    lon_cto, lat_cto = alinhar_ponto_na_rua(Point(cx, cy), malha_viaria)
-                    
-                    # Aplica a regra de nomenclatura para a CTO
-                    if nomear_auto:
-                        nome_cto = f"{cto_global_counter:03d}_{no_olt}_SP{pon_atual}_SS{idx_local + 1}"
-                    else:
-                        nome_cto = "CTO"
-                    
-                    lista_ctos.append({"nome": nome_cto, "coords": (lon_cto, lat_cto), "icone": icone_pon})
-                    ctos_metadata.append({"nome": nome_cto, "pon": pon_atual, "lon": lon_cto, "lat": lat_cto})
-                    cto_global_counter += 1
-                    
-                pon_atual += 1
-                ctos_nesta_pon = []
-            
-        # ==========================================================
-        # LÓGICA DE CABEAMENTO FÍSICO COM CORES
-        # ==========================================================
-        for p_num in range(pon_inicial, pon_final + 1):
-            ctos_da_pon = [c for c in ctos_metadata if c['pon'] == p_num]
-            if not ctos_da_pon: continue
-            
-            _, cor_cabo_pon = obter_paleta_pon(p_num)
+            icone_pon_temp, _ = obter_paleta_pon(pon_numero)
+            icone_pon = (
+                icone_pon_temp
+                if colorir_cto
+                else "http://maps.google.com/mapfiles/kml/pushpin/ylw-pushpin.png"
+            )
+
+            for ss_local, cto in enumerate(ctos_ordenadas, start=1):
+                lon_cto, lat_cto = alinhar_ponto_na_rua(
+                    Point(*cto["coords_brutas"]),
+                    malha_viaria,
+                    distancia_maxima_metros=distancia_maxima_snap,
+                    logger=logger,
+                    rotulo=cto["id"],
+                )
+                cto["coords"] = (lon_cto, lat_cto)
+                cto["pon_numero"] = pon_numero
+                cto["ceo_id"] = ceo["id"]
+                cto["hc_estimado_teorico"] = len(cto["hp_indices"]) * penetracao
+                nome_cto = (
+                    f"{cto_global_counter:03d}_{no_olt}_SP{pon_numero}_SS{ss_local}"
+                    if nomear_auto
+                    else "CTO"
+                )
+                cto["nome"] = nome_cto
+                cto["referencia"] = nome_cto if nomear_auto else cto["id"]
+
+                descricao = (
+                    f"ID interno: {cto['id']}\n"
+                    f"HP cobertos: {len(cto['hp_indices'])}/{capacidade_hp}\n"
+                    f"HC esperado (teórico): {cto['hc_estimado_teorico']:.1f}\n"
+                    f"Splitter inicial: 1x{splitter_inicial}\n"
+                    f"Expansão: 1x{splitter_expansao}\n"
+                    f"PON: {pon_numero}"
+                )
+                lista_ctos.append(
+                    {
+                        "id": cto["id"],
+                        "nome": nome_cto,
+                        "coords": cto["coords"],
+                        "icone": icone_pon,
+                        "descricao": descricao,
+                    }
+                )
+                ctos_metadata_ceo.append(cto)
+                cto_global_counter += 1
+
+            pon_global_counter += 1
+
+        # Cabeamento de distribuição preserva os grupos PON já capacitados.
+        for pon in pons_ceo:
+            p_num = pon["numero"]
+            ctos_da_pon = [ctos_por_id[cid] for cid in pon["cto_ids"]]
+            if not ctos_da_pon:
+                continue
+            cor_cabo_pon = obter_cor_cabo_pon(p_num, colorir_cabos)
             conectadas = []
-            
-            def adicionar_cabo_dist(origem_nome, coord_origem, destino_nome, coord_destino, tipo):
-                rota = calcular_rota_pela_rua(grafo_ruas, coord_origem, coord_destino)
-                dist_m = calcular_metragem_rota(rota)
-                alerta = " [⚠️ >150m]" if dist_m > 150 else ""
-                nome_cabo = f"Cabo_{tipo}_{origem_nome}_to_{destino_nome} ({dist_m:.0f}m){alerta}"
-                lista_cabos_dist.append({"nome": nome_cabo, "coords": rota, "cor": cor_cabo_pon})
+
+            def obter_rota(coord_origem, coord_destino):
+                return calcular_rota_detalhada(
+                    grafo_ruas,
+                    coord_origem,
+                    coord_destino,
+                    distancia_maxima_snap,
+                )
+
+            def registrar_ligacao_dist(
+                origem_ref,
+                coord_origem,
+                destino_ref,
+                coord_destino,
+                tipo,
+                resultado=None,
+            ):
+                resultado = resultado or obter_rota(coord_origem, coord_destino)
+                if resultado.valida:
+                    dist_m = resultado.distancia_m
+                    alerta = (
+                        f" [⚠️ >{distancia_maxima_entre_ctos:.0f}m]"
+                        if dist_m > distancia_maxima_entre_ctos
+                        else ""
+                    )
+                    lista_cabos_dist.append(
+                        {
+                            "nome": (
+                                f"Cabo_{tipo}_{origem_ref}_to_{destino_ref} "
+                                f"({dist_m:.0f}m){alerta}"
+                            ),
+                            "coords": resultado.coordenadas,
+                            "cor": cor_cabo_pon,
+                            "descricao": f"Status de rota: {resultado.status}",
+                        }
+                    )
+                    return resultado
+
+                descricao = (
+                    f"Status: {resultado.status}\n"
+                    f"Tipo: {tipo}\n"
+                    f"Origem: {origem_ref}\n"
+                    f"Destino: {destino_ref}\n"
+                    f"Detalhe: {resultado.mensagem or 'rota viária indisponível'}"
+                )
+                excecao = {
+                    "status": resultado.status,
+                    "tipo": tipo,
+                    "origem": origem_ref,
+                    "destino": destino_ref,
+                    "mensagem": resultado.mensagem,
+                    "distancia_origem_malha_m": resultado.distancia_origem_malha_m,
+                    "distancia_destino_malha_m": resultado.distancia_destino_malha_m,
+                    "coords_referencia": [list(coord_origem), list(coord_destino)],
+                }
+                lista_excecoes_roteamento.append(excecao)
+                lista_excecoes_roteamento[-1]["escopo"] = "distribuicao"
+                logger.warning(
+                    "⚠️ Rota %s → %s não criada (%s).",
+                    origem_ref,
+                    destino_ref,
+                    resultado.status,
+                )
+                return resultado
 
             for i, cto_atual in enumerate(ctos_da_pon):
-                coord_atual = (cto_atual['lon'], cto_atual['lat'])
+                coord_atual = cto_atual["coords"]
                 if i == 0:
-                    adicionar_cabo_dist(nome_ceo, coord_ceo, cto_atual['nome'], coord_atual, "Feed_Primario")
+                    registrar_ligacao_dist(
+                        ceo["referencia"],
+                        ceo["coords"],
+                        cto_atual["referencia"],
+                        coord_atual,
+                        "Feed_Primario",
+                    )
                     conectadas.append(cto_atual)
+                    continue
+
+                cto_ant = ctos_da_pon[i - 1]
+                coord_ant = cto_ant["coords"]
+                rota_seq = obter_rota(coord_ant, coord_atual)
+
+                if (
+                    rota_seq.valida
+                    and rota_seq.distancia_m <= distancia_maxima_entre_ctos
+                ):
+                    registrar_ligacao_dist(
+                        cto_ant["referencia"],
+                        coord_ant,
+                        cto_atual["referencia"],
+                        coord_atual,
+                        "Cascata",
+                        resultado=rota_seq,
+                    )
+                    conectadas.append(cto_atual)
+                    continue
+
+                melhor = None
+                for cto_con in conectadas:
+                    rota_cand = obter_rota(cto_con["coords"], coord_atual)
+                    if (
+                        rota_cand.valida
+                        and rota_cand.distancia_m <= distancia_maxima_entre_ctos
+                        and (melhor is None or rota_cand.distancia_m < melhor[0])
+                    ):
+                        melhor = (rota_cand.distancia_m, cto_con, rota_cand)
+
+                if melhor is not None:
+                    _, cto_con, rota_cand = melhor
+                    registrar_ligacao_dist(
+                        cto_con["referencia"],
+                        cto_con["coords"],
+                        cto_atual["referencia"],
+                        coord_atual,
+                        "Derivacao",
+                        resultado=rota_cand,
+                    )
                 else:
-                    cto_ant = ctos_da_pon[i-1]
-                    coord_ant = (cto_ant['lon'], cto_ant['lat'])
-                    rota_seq = calcular_rota_pela_rua(grafo_ruas, coord_ant, coord_atual)
-                    dist_seq = calcular_metragem_rota(rota_seq)
+                    registrar_ligacao_dist(
+                        ceo["referencia"],
+                        ceo["coords"],
+                        cto_atual["referencia"],
+                        coord_atual,
+                        "Feed_Extra",
+                    )
+                conectadas.append(cto_atual)
 
-                    if dist_seq <= 150:
-                        nome_cabo = f"Cabo_Cascata_{cto_ant['nome']}_to_{cto_atual['nome']} ({dist_seq:.0f}m)"
-                        lista_cabos_dist.append({"nome": nome_cabo, "coords": rota_seq, "cor": cor_cabo_pon})
-                        conectadas.append(cto_atual)
-                    else:
-                        melhor_derivacao, menor_dist_derivacao, melhor_rota = None, float('inf'), None
-                        for cto_con in conectadas:
-                            coord_con = (cto_con['lon'], cto_con['lat'])
-                            rota_cand = calcular_rota_pela_rua(grafo_ruas, coord_con, coord_atual)
-                            dist_cand = calcular_metragem_rota(rota_cand)
-                            if dist_cand <= 150 and dist_cand < menor_dist_derivacao:
-                                menor_dist_derivacao, melhor_derivacao, melhor_rota = dist_cand, cto_con, rota_cand
+    # Backbone físico: quando a OLT possui coordenadas, ela participa da árvore
+    # OLT -> CEOs. Rotas inválidas recebem penalidade para serem usadas somente
+    # quando necessárias para conectar componentes e são exportadas como exceção.
+    nos_backbone = [
+        {
+            "id": c["id"],
+            "referencia": c["referencia"],
+            "coords": c["coords"],
+            "tipo": "CEO",
+        }
+        for c in ceos_ordenadas
+    ]
+    if olt_fisica is not None:
+        nos_backbone.insert(
+            0,
+            {
+                "id": olt_fisica["id"],
+                "referencia": olt_fisica["referencia"],
+                "coords": olt_fisica["coords"],
+                "tipo": "OLT",
+            },
+        )
 
-                        if melhor_derivacao:
-                            nome_cabo = f"Cabo_Derivacao_{melhor_derivacao['nome']}_to_{cto_atual['nome']} ({menor_dist_derivacao:.0f}m)"
-                            lista_cabos_dist.append({"nome": nome_cabo, "coords": melhor_rota, "cor": cor_cabo_pon})
-                            conectadas.append(cto_atual)
-                        else:
-                            adicionar_cabo_dist(nome_ceo, coord_ceo, cto_atual['nome'], coord_atual, "Feed_Extra")
-                            conectadas.append(cto_atual)
-
-        pon_global_counter += pons_nesta_ceo
-
-    # ==========================================================
-    # INTERLIGAÇÃO DAS CEOs (BACKBONE COM COR ÚNICA)
-    # ==========================================================
-    if len(lista_ceos) > 1:
+    if len(nos_backbone) > 1:
         G_backbone = nx.Graph()
-        for c1, c2 in itertools.combinations(lista_ceos, 2):
-            rota = calcular_rota_pela_rua(grafo_ruas, c1['coords'], c2['coords'])
-            dist_real = calcular_metragem_rota(rota)
-            G_backbone.add_edge(c1['nome'], c2['nome'], weight=dist_real, coord1=c1['coords'], coord2=c2['coords'])
-            
-        mst_backbone = nx.minimum_spanning_tree(G_backbone, weight='weight')
-        for u, v, data in mst_backbone.edges(data=True):
-            rota = calcular_rota_pela_rua(grafo_ruas, data['coord1'], data['coord2'])
-            dist_real = calcular_metragem_rota(rota)
-            lista_cabos_backbone.append({
-                "nome": f"Cabo_Backbone_{u}_to_{v} ({dist_real:.0f}m)",
-                "coords": rota,
-                "cor": "ff0000ff" # Vermelho intenso exclusivo para Backbone
-            })
+        for no in nos_backbone:
+            G_backbone.add_node(no["id"], **no)
+
+        for n1, n2 in itertools.combinations(nos_backbone, 2):
+            resultado = calcular_rota_detalhada(
+                grafo_ruas,
+                n1["coords"],
+                n2["coords"],
+                distancia_maxima_snap,
+            )
+            distancia_referencia = calcular_distancia_metros(
+                *n1["coords"], *n2["coords"]
+            )
+            peso = (
+                resultado.distancia_m
+                if resultado.valida
+                else 1_000_000_000.0 + distancia_referencia
+            )
+            G_backbone.add_edge(
+                n1["id"],
+                n2["id"],
+                weight=peso,
+                resultado=resultado,
+                no1=n1,
+                no2=n2,
+            )
+
+        mst_backbone = nx.minimum_spanning_tree(G_backbone, weight="weight")
+        for _, _, data in mst_backbone.edges(data=True):
+            resultado = data["resultado"]
+            n1 = data["no1"]
+            n2 = data["no2"]
+            tipo = "Feeder_OLT" if "OLT" in (n1["tipo"], n2["tipo"]) else "Backbone"
+
+            if resultado.valida:
+                lista_cabos_backbone.append(
+                    {
+                        "nome": (
+                            f"Cabo_{tipo}_{n1['referencia']}_to_{n2['referencia']} "
+                            f"({resultado.distancia_m:.0f}m)"
+                        ),
+                        "coords": resultado.coordenadas,
+                        "cor": "ff0000ff",
+                        "descricao": f"Status de rota: {resultado.status}",
+                    }
+                )
+            else:
+                lista_excecoes_roteamento.append(
+                    {
+                        "escopo": "backbone",
+                        "status": resultado.status,
+                        "tipo": tipo,
+                        "origem": n1["referencia"],
+                        "destino": n2["referencia"],
+                        "mensagem": resultado.mensagem,
+                        "distancia_origem_malha_m": resultado.distancia_origem_malha_m,
+                        "distancia_destino_malha_m": resultado.distancia_destino_malha_m,
+                        "coords_referencia": [list(n1["coords"]), list(n2["coords"])],
+                    }
+                )
+                logger.warning(
+                    "⚠️ Backbone %s → %s sem rota viária (%s).",
+                    n1["referencia"],
+                    n2["referencia"],
+                    resultado.status,
+                )
+
+    # Relatório auditável da alocação capacitada.
+    relatorio = {
+        "projeto": nome_projeto,
+        "olt": (
+            {
+                "id": olt_fisica["id"],
+                "nome": olt_fisica["nome"],
+                "coords_configuradas": list(olt_fisica["coords_brutas"]),
+                "coords_finais": list(olt_fisica["coords"]),
+            }
+            if olt_fisica is not None
+            else None
+        ),
+        "roteamento": {
+            "nos_malha_viaria": len(grafo_ruas),
+            "bbox_consultado": list(bbox_roteamento),
+            "cabos_distribuicao_validos": len(lista_cabos_dist),
+            "cabos_backbone_validos": len(lista_cabos_backbone),
+            "quantidade_excecoes": len(lista_excecoes_roteamento),
+            "status": "OK" if not lista_excecoes_roteamento else "COM_EXCECOES",
+            "excecoes": lista_excecoes_roteamento,
+        },
+        "regra_cto": {
+            "capacidade_hp": capacidade_hp,
+            "splitter_inicial": splitter_inicial,
+            "splitter_expansao": splitter_expansao,
+            "penetracao_estimada": penetracao,
+        },
+        "validacao": validacao,
+        "ctos": [
+            {
+                "id": c["id"],
+                "nome": c.get("nome", "CTO"),
+                "pon_id": c["pon_id"],
+                "pon_numero": c.get("pon_numero"),
+                "ceo_id": c.get("ceo_id"),
+                "hp_atribuidos": len(c["hp_indices"]),
+                "hp_indices": c["hp_indices"],
+                "coords_brutas": list(c["coords_brutas"]),
+                "coords_finais": list(c.get("coords", c["coords_brutas"])),
+            }
+            for c in ctos
+        ],
+        "pons": [
+            {
+                "id": p["id"],
+                "numero": p.get("numero"),
+                "ceo_id": p["ceo_id"],
+                "cto_ids": p["cto_ids"],
+            }
+            for p in pons
+        ],
+        "ceos": [
+            {
+                "id": c["id"],
+                "nome": c.get("nome", "CEO"),
+                "pon_ids": c["pon_ids"],
+                "coords": list(c["coords"]),
+            }
+            for c in ceos_ordenadas
+        ],
+    }
+    caminho_relatorio = OUTPUT_DIR / f"{nome_projeto} - Alocacao FTTH.json"
+    caminho_relatorio.write_text(
+        json.dumps(relatorio, ensure_ascii=False, indent=4), encoding="utf-8"
+    )
 
     logger.info("📦 Exportando elementos de rede...")
-    
     caminho_ctos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Terminação Óptica (CTO).kml"
     caminho_ceos = OUTPUT_DIR / f"{nome_projeto} - Caixas de Emenda Óptica (CEO).kml"
+    caminho_olts = OUTPUT_DIR / f"{nome_projeto} - OLT.kml"
     caminho_cabos_dist = OUTPUT_DIR / f"{nome_projeto} - Cabos de Distribuição.kml"
-    caminho_cabos_backbone = OUTPUT_DIR / f"{nome_projeto} - Cabos de Backbone (CEOs).kml"
+    caminho_cabos_backbone = OUTPUT_DIR / f"{nome_projeto} - Cabos de Backbone (OLT-CEOs).kml"
+    caminho_excecoes = OUTPUT_DIR / f"{nome_projeto} - Excecoes de Roteamento.kml"
 
     criar_kml_pontos_dinamico(caminho_ctos, "CTOs Posicionadas", lista_ctos, logger)
     criar_kml_pontos_dinamico(caminho_ceos, "CEOs Posicionadas", lista_ceos, logger)
-    
-    criar_kml_linhas_dinamico(caminho_cabos_dist, "Cabos de Distribuição", lista_cabos_dist, logger)
+    if lista_olts:
+        criar_kml_pontos_dinamico(caminho_olts, "OLT", lista_olts, logger)
+    elif caminho_olts.exists():
+        caminho_olts.unlink()
+    criar_kml_linhas_dinamico(
+        caminho_cabos_dist, "Cabos de Distribuição", lista_cabos_dist, logger
+    )
     if lista_cabos_backbone:
-        criar_kml_linhas_dinamico(caminho_cabos_backbone, "Cabos de Backbone", lista_cabos_backbone, logger)
-    
-    logger.info(f"✅ Execução Concluída! {len(lista_ctos)} CTOs e {len(lista_ceos)} CEOs posicionadas.")
+        criar_kml_linhas_dinamico(
+            caminho_cabos_backbone,
+            "Cabos de Backbone e Feeder",
+            lista_cabos_backbone,
+            logger,
+        )
+    elif caminho_cabos_backbone.exists():
+        caminho_cabos_backbone.unlink()
+
+    if lista_excecoes_roteamento:
+        linhas_excecao = []
+        for indice, exc in enumerate(lista_excecoes_roteamento, start=1):
+            origem, destino = exc["coords_referencia"]
+            linhas_excecao.append(
+                {
+                    "nome": (
+                        f"EXCECAO_{indice:03d}_{exc['status']}_"
+                        f"{exc['origem']}_to_{exc['destino']}"
+                    ),
+                    "coords": [tuple(origem), tuple(destino)],
+                    "cor": "ff0000ff",
+                    "descricao": (
+                        "LINHA DE REFERÊNCIA - NÃO É ROTA VÁLIDA\n"
+                        f"Escopo: {exc['escopo']}\n"
+                        f"Status: {exc['status']}\n"
+                        f"Tipo: {exc['tipo']}\n"
+                        f"Origem: {exc['origem']}\n"
+                        f"Destino: {exc['destino']}\n"
+                        f"Detalhe: {exc.get('mensagem') or 'rota não encontrada'}"
+                    ),
+                }
+            )
+        criar_kml_linhas_dinamico(
+            caminho_excecoes,
+            "Exceções de Roteamento - Referência",
+            linhas_excecao,
+            logger,
+            largura=4,
+        )
+        logger.warning(
+            "⚠️ %d ligação(ões) sem rota válida exportadas em %s.",
+            len(lista_excecoes_roteamento),
+            caminho_excecoes.name,
+        )
+    else:
+        if caminho_excecoes.exists():
+            caminho_excecoes.unlink()
+        logger.info("✅ Todas as ligações selecionadas possuem rota viária válida.")
+
+    logger.info(
+        "✅ Execução concluída: %d HP, %d CTOs, %d PONs, %d CEOs e %d exceção(ões) de rota. Máx. %d HP/CTO.",
+        len(casas_coords),
+        len(ctos),
+        len(pons),
+        len(ceos),
+        len(lista_excecoes_roteamento),
+        validacao["maior_ocupacao_hp_cto"],
+    )
+
 
 def executar():
     try:
-        CONFIG = ConfigValidator.validar(CONFIG_FILE)
-    except (ValueError, FileNotFoundError) as e:
-        print(f"❌ Erro na configuração: {e}")
-        return
-    arquivos_kml = list(INPUT_DIR.glob("*.kml")) + list(INPUT_DIR.glob("*.kmz"))
-    if not arquivos_kml:
-        print("❌ Erro: Nenhum arquivo KML/KMZ em data/input/")
+        CONFIG = carregar_config()
+        arquivo_projeto = resolver_arquivo_projeto(INPUT_DIR, CONFIG)
+        resolver_arquivo_correcoes(INPUT_DIR, CONFIG)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"❌ Erro de entrada/configuração: {exc}")
         return
 
-    arquivo_projeto = arquivos_kml[0]
     nome_projeto = arquivo_projeto.stem
     logger = configurar_logger(OUTPUT_DIR, nome_projeto)
-    logger.info(f"Iniciando processamento do projeto: {nome_projeto}")
-    
+    logger.info("Iniciando processamento do projeto: %s", nome_projeto)
+    logger.info("📄 Arquivo de projeto: %s", arquivo_projeto.name)
+
     caminho_dados = OUTPUT_DIR / f"{nome_projeto}_dados_calculados.json"
     if not os.path.exists(caminho_dados):
         logger.error(f"Arquivo de cálculos '{caminho_dados}' não encontrado.")
-        return 
-        
-    with open(caminho_dados, 'r', encoding='utf-8') as f:
+        return
+
+    with open(caminho_dados, "r", encoding="utf-8") as f:
         dados = json.load(f)
-        
-    olt = CONFIG['equipamentos']['nome_olt_padrao']
-    executar_posicionamento_inteligente(str(arquivo_projeto), dados['ctos'], dados['pons'], olt, nome_projeto, logger, CONFIG)
+
+    olt = CONFIG["equipamentos"]["nome_olt_padrao"]
+    try:
+        executar_posicionamento_inteligente(
+            str(arquivo_projeto),
+            dados["ctos"],
+            dados["pons"],
+            olt,
+            nome_projeto,
+            logger,
+            CONFIG,
+        )
+    except (ValueError, FileNotFoundError, ClusterizacaoError) as exc:
+        logger.error("❌ Falha no posicionamento: %s", exc)
+
 
 if __name__ == "__main__":
     executar()

@@ -1,21 +1,20 @@
 #!/bin/bash
-# install.sh
+set -e
 
-echo "🚀 Instalando GH Fiber Construction Pro v2.0..."
+echo "Instalando GH Fiber Construction Pro v2.0..."
 
-# Criar venv
 python3 -m venv venv
 source venv/bin/activate
 
-# Instalar dependências
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
-# Validar instalação
-python -c "import overturemaps; import shapely; print('✅ Dependências OK')"
+python -c "import overturemaps; import shapely; import networkx; import sklearn; print('Dependencias OK')"
 
-# Criar diretórios
-mkdir -p data/input data/output logs tests
+mkdir -p data/input data/output
 
-echo "✅ Instalação concluída!"
-echo "Execute: source venv/bin/activate"
+python tests/validate_config.py
+
+echo "Instalacao concluida."
+echo "Ative o ambiente: source venv/bin/activate"
+echo "Execute o sistema: python -m src"

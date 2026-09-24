@@ -1,14 +1,27 @@
 {
-    "versao": "2.0",
+    "versao": "6.0",
+    "entrada": {
+        "arquivo_projeto": null,
+        "arquivo_correcoes": null
+    },
     "engenharia": {
-        "penetracao_estimada": 0.50,
-        "capacidade_splitter_cto": 8,
+        "penetracao_estimada": 0.5,
+        "reserva_capacidade_percentual": 0.0,
+        "capacidade_hp_por_cto": 16,
+        "splitter_cto_inicial": 8,
+        "splitter_cto_expansao": 16,
         "ctos_por_pon": 8,
         "pons_por_ceo": 2,
-        "distancia_maxima_snap_metros": 50 
+        "distancia_maxima_snap_metros": 50,
+        "distancia_maxima_entre_ctos_metros": 150,
+        "margem_bbox_roteamento_metros": 150
     },
     "equipamentos": {
-        "nome_olt_padrao": "N70"
+        "nome_olt_padrao": "N70",
+        "olt": {
+            "latitude": null,
+            "longitude": null
+        }
     },
     "opcoes_visuais_e_nomes": {
         "nomear_cto_ceo_automaticamente": false,
@@ -18,10 +31,11 @@
     "api": {
         "overpass_timeout_segundos": 60,
         "overture_timeout_segundos": 60,
-        "overpass_retry_max": 5
+        "overpass_retry_max": 5,
+        "overpass_backoff_factor": 1.0
     },
     "cache": {
-        "versao": "1.0",
+        "versao": "2.0",
         "expirar_dias": 30
     }
 }

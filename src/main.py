@@ -1,16 +1,10 @@
 import sys
 import time
-from pathlib import Path
-
 # Importando os módulos internos do seu projeto
-from config_validator import ConfigValidator
-import contagem_hp
-import posicionamento
-import logger_config
+from .config import carregar_config
+from . import contagem_hp
+from . import posicionamento
 
-# Descobrindo a raiz do projeto e o caminho do config.json
-BASE_DIR = Path(__file__).resolve().parent.parent
-CONFIG_FILE = BASE_DIR / "config.json"
 
 def exibir_menu():
     print("\n" + "="*50)
@@ -25,8 +19,8 @@ def exibir_menu():
     print("="*50)
 
 def main():
-    print("Iniciando o ambiente virtual e carregando módulos...")
-    time.sleep(1)
+    print("Carregando módulos do GH Fiber Construction Pro...")
+    time.sleep(0.2)
 
     while True:
         exibir_menu()
@@ -36,7 +30,7 @@ def main():
             print("\n[>>] Lendo config.json e validando parâmetros...")
             try:
                 # Agora chamamos a Classe e passamos o caminho do arquivo!
-                ConfigValidator.validar(CONFIG_FILE) 
+                carregar_config() 
                 print("[OK] Configurações validadas com sucesso!")
             except Exception as e:
                 print(f"[ERRO] Falha na validação: {e}")
@@ -55,7 +49,7 @@ def main():
             print("\n[>>] Iniciando automação completa do Projeto FTTH...")
             try:
                 # No fluxo completo, também precisamos validar corretamente
-                ConfigValidator.validar(CONFIG_FILE)
+                carregar_config()
                 contagem_hp.executar()
                 posicionamento.executar()
                 print("[OK] Fluxo completo executado com sucesso!")
