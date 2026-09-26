@@ -7,14 +7,14 @@ import io
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any
 
-from shapely.geometry import MultiPolygon, Polygon
+from shapely.geometry import MultiPolygon, Polygon, Point
 
 KML_NS = "http://www.opengis.net/kml/2.2"
 NS = {"kml": KML_NS}
 EXTENSOES_SUPORTADAS = {".kml", ".kmz"}
-MARCADORES_CORRECAO = ("editad", "corrig")
+MARCADORES_CORRECAO = ("editad", "corrig", "poste")
 
 
 def _ler_xml_kml(caminho: Path) -> ET.Element:
@@ -253,7 +253,7 @@ def resolver_arquivo_correcoes(input_dir: Path, config: Dict) -> Optional[Path]:
     if explicito:
         return _resolver_explicito(input_dir, explicito, "correções")
 
-    candidatos = [p for p in _arquivos_geoespaciais(input_dir) if eh_arquivo_correcao(p)]
+    candidatos = [p for p in _arquivos_geoespaciais(input_dir) if eh_arquivo_correcao(p) and "poste" not in p.name.lower()]
     if not candidatos:
         return None
     if len(candidatos) > 1:
@@ -263,3 +263,43 @@ def resolver_arquivo_correcoes(input_dir: Path, config: Dict) -> Optional[Path]:
             f"{nomes}. Defina 'entrada.arquivo_correcoes' no config.json."
         )
     return candidatos[0]
+
+def resolver_arquivo_postes(input_dir: Path, config: Dict) -> Optional[Path]:
+    """Resolve e valida o arquivo opcional de postes físicos na Fase 7."""
+    entrada = config.get("entrada", {})
+    explicito = entrada.get("arquivo_postes")
+    
+    if explicito:
+        return _resolver_explicito(input_dir, explicito, "postes")
+
+    candidatos = [p for p in _arquivos_geoespaciais(input_dir) if "poste" in p.name.lower()]
+    if not candidatos:
+        return None
+    if len(candidatos) > 1:
+        nomes = ", ".join(p.name for p in candidatos)
+        raise ValueError(
+            "Mais de um arquivo de postes foi encontrado em data/input/: "
+            f"{nomes}. Defina 'entrada.arquivo_postes' no config.json."
+        )
+    return candidatos[0]
+
+def calcular_metragem_com_reserva(distancia_metros: float, configuracao: Dict[str, Any], tipo_elemento: str = "distribuicao") -> float:
+    """
+    Aplica as margens de flecha e reservas técnicas configuradas na Fase 7
+    ao comprimento final do cabo para orçamentação e lista de materiais (BOM).
+    """
+    engenharia = configuracao.get("engenharia", {})
+    fisica = engenharia.get("fisica", {})
+    
+    flecha = fisica.get("margem_flecha_percentual", 0.03)
+    distancia_com_flecha = distancia_metros * (1 + flecha)
+    
+    reserva = 0.0
+    if tipo_elemento == "cto":
+        reserva = fisica.get("reserva_tecnica_cto_metros", 10.0)
+    elif tipo_elemento == "ceo":
+        reserva = fisica.get("reserva_tecnica_ceo_metros", 30.0)
+    elif tipo_elemento == "olt":
+        reserva = fisica.get("reserva_tecnica_olt_metros", 50.0)
+        
+    return round(distancia_com_flecha + reserva, 2)

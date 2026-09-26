@@ -1,41 +1,64 @@
 {
-    "versao": "6.0",
-    "entrada": {
-        "arquivo_projeto": null,
-        "arquivo_correcoes": null
+  "versao": "9.0",
+  "entrada": {
+    "arquivo_projeto": null,
+    "arquivo_correcoes": null,
+    "arquivo_postes": null
+  },
+  "engenharia": {
+    "penetracao_estimada": 0.5,
+    "reserva_capacidade_percentual": 0.0,
+    "capacidade_hp_por_cto": 16,
+    "splitter_cto_inicial": 8,
+    "splitter_cto_expansao": 16,
+    "ctos_por_pon": 8,
+    "pons_por_ceo": 2,
+    "distancia_maxima_snap_metros": 50,
+    "distancia_maxima_entre_ctos_metros": 150,
+    "margem_bbox_roteamento_metros": 150,
+    "fisica": {
+      "margem_flecha_percentual": 0.03,
+      "reserva_tecnica_cto_metros": 10.0,
+      "reserva_tecnica_ceo_metros": 30.0,
+      "reserva_tecnica_olt_metros": 50.0
     },
-    "engenharia": {
-        "penetracao_estimada": 0.5,
-        "reserva_capacidade_percentual": 0.0,
-        "capacidade_hp_por_cto": 16,
-        "splitter_cto_inicial": 8,
-        "splitter_cto_expansao": 16,
-        "ctos_por_pon": 8,
-        "pons_por_ceo": 2,
-        "distancia_maxima_snap_metros": 50,
-        "distancia_maxima_entre_ctos_metros": 150,
-        "margem_bbox_roteamento_metros": 150
-    },
-    "equipamentos": {
-        "nome_olt_padrao": "N70",
-        "olt": {
-            "latitude": null,
-            "longitude": null
-        }
-    },
-    "opcoes_visuais_e_nomes": {
-        "nomear_cto_ceo_automaticamente": false,
-        "colorir_cto_por_pon": true,
-        "colorir_cabos_por_pon": true
-    },
-    "api": {
-        "overpass_timeout_segundos": 60,
-        "overture_timeout_segundos": 60,
-        "overpass_retry_max": 5,
-        "overpass_backoff_factor": 1.0
-    },
-    "cache": {
-        "versao": "2.0",
-        "expirar_dias": 30
+    "topologia_backbone": {
+      "modo": "anel",
+      "permitir_rotas_parcialmente_disjuntas": true
     }
+  },
+  "equipamentos": {
+    "nome_olt_padrao": "N70",
+    "olt": {
+      "latitude": null,
+      "longitude": null
+    }
+  },
+  "orcamento_optico": {
+    "potencia_saida_olt_dbm": 4.5,
+    "sensibilidade_minima_onu_dbm": -27.0,
+    "margem_seguranca_db": 2.0,
+    "perdas": {
+      "fibra_por_km": 0.25,
+      "fusao": 0.1,
+      "conector": 0.5,
+      "splitter_1x8": 10.5,
+      "splitter_1x16": 13.5
+    }
+  },
+  "opcoes_visuais_e_nomes": {
+    "nomear_cto_ceo_automaticamente": false,
+    "colorir_cto_por_pon": true,
+    "colorir_cabos_por_pon": true
+  },
+  "api": {
+    "overpass_timeout_segundos": 60,
+    "overture_timeout_segundos": 60,
+    "overpass_retry_max": 5,
+    "overpass_backoff_factor": 1.0
+  },
+  "cache": {
+    "versao": "2.0",
+    "expirar_dias": 30
+  }
 }
