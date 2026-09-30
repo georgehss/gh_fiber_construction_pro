@@ -3,7 +3,7 @@ set -e
 
 echo "Instalando GH Fiber Construction Pro v2.0..."
 
-python3 -m venv venv
+python3 -m venv .venv
 source venv/bin/activate
 
 python -m pip install --upgrade pip
